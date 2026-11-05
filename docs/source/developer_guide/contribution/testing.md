@@ -396,25 +396,19 @@ For block extraction, plan preview, and selection rules, see the usage notes and
 
 ### Run docs link check
 
-You can validate external links in the Sphinx docs locally with:
+The documentation site is built with MkDocs. To check external HTTP(S) links in Markdown files:
 
 ```bash
-make -C docs linkcheck SPHINXOPTS="-W --keep-going"
+python .github/workflows/scripts/check_md_links.py <changed.md> [more.md ...]
 ```
 
-To check links in a specific Markdown file, pass the file to `sphinx-build`.
-For example, to check only `docs/source/user_guide/release_notes.md`:
+To check all English documentation:
 
 ```bash
-cd docs
-sphinx-build -b linkcheck -W --keep-going \
-  source _build/linkcheck source/user_guide/release_notes.md
+python .github/workflows/scripts/check_md_links.py docs/source --exclude 'docs/source/zh'
 ```
 
-The detailed report will be written to:
-
-- `docs/_build/linkcheck/output.txt`
-- `docs/_build/linkcheck/output.json`
+The script checks HTTP(S) links only and skips URLs inside fenced code blocks. CI runs it from `.github/workflows/schedule_doc_linkcheck.yaml` (weekly, and on pull requests that change `docs/source/**/*.md`). To check Markdown style locally, run `bash format.sh ci` from the repository root (requires `pre-commit`).
 
 ## PR testing requirements
 
