@@ -1,4 +1,5 @@
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -114,7 +115,7 @@ def test_logprob_delta_over_threshold_fails(tmp_path: Path):
 
     assert code == compare_tool.EXIT_MISMATCH
     assert "logprob delta 0.300000 at position 1 exceeds" in report
-    assert "| `p1` | yes | 2/2 | yes | 100.00% | 0.300000 |" in report
+    assert "| `p1` | yes | 2/2 | yes | 100.00% | 0 | 0.300000 |" in report
 
 
 def test_logprob_delta_within_threshold_passes(tmp_path: Path):
@@ -464,3 +465,129 @@ def test_prompt_set_is_replayable_by_collect():
         payload = compare_tool.build_completion_payload(request, "GLM-5.1")
         assert payload["logprobs"] == compare_tool.LOGPROB_TOP_K
         assert payload["prompt"] == request["prompt"]
+
+
+def test_non_greedy_divergence_skips_logprobs_of_that_position(tmp_path: Path):
+    # R1: the two runs emitted different tokens at position 1, so the two logprobs
+    # belong to different random variables and must not be compared.
+    tokens_a = ["m", "n", "o"]
+    tokens_b = ["m", "NN", "o"]
+    records_a = [make_record("s1", tokens_a, [-0.1, -0.2, -0.3], backend="mrv1", temperature=0.7)]
+    records_b = [make_record("s1", tokens_b, [-0.1, -0.7, -0.3], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_OK
+    assert "non-comparable positions (tokens differ) | 1 |" in report
+    assert "| `s1` | 1 | `n` | `NN` |" in report
+    assert "## Verdict: PASS" in report
+
+
+def test_same_token_position_over_threshold_still_fails(tmp_path: Path):
+    tokens = ["m", "n"]
+    records_a = [make_record("s1", tokens, [-0.1, -0.2], backend="mrv1", temperature=0.7)]
+    records_b = [make_record("s1", tokens, [-0.1, -0.7], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "logprob delta 0.500000 at position 1 exceeds" in report
+    assert "comparable position(s) over threshold" in report
+    assert "non-comparable positions (tokens differ) | 0 |" in report
+
+
+def test_incomparable_positions_reach_the_json_report(tmp_path: Path):
+    records_a = [make_record("s1", ["m", "n"], [-0.1, -0.2], backend="mrv1", temperature=0.7)]
+    records_b = [make_record("s1", ["m", "NN"], [-0.1, -0.9], backend="mrv2", temperature=0.7)]
+    path_a, path_b = write_pair(tmp_path, records_a, records_b)
+    out = tmp_path / "report.json"
+
+    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+
+    assert code == compare_tool.EXIT_OK
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["metrics"]["incomparable_positions"] == 1
+    assert payload["records"][0]["incomparable"] == [{"position": 1, "a": "n", "b": "NN"}]
+
+
+def test_token_length_mismatch_under_greedy_fails(tmp_path: Path):
+    records_a = [make_record("g1", ["a", "b", "c"], backend="mrv1", temperature=0.0)]
+    records_b = [make_record("g1", ["a", "b"], backend="mrv2", temperature=0.0)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "g1: greedy generation diverged at token 2" in report
+
+
+def test_token_length_mismatch_under_sampling_passes(tmp_path: Path):
+    records_a = [make_record("s1", ["a", "b", "c"], backend="mrv1", temperature=0.7)]
+    records_b = [make_record("s1", ["a", "b"], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_OK
+    assert "| 3/2 |" in report
+    assert "## Verdict: PASS" in report
+
+
+def test_temperature_mismatch_fails(tmp_path: Path):
+    records_a = [make_record("p1", ["a", "b"], backend="mrv1", temperature=0.0)]
+    records_b = [make_record("p1", ["a", "b"], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "temperature differs (--a=0.0, --b=0.7)" in report
+    assert "the two runs are not the same configuration" in report
+
+
+def test_temperature_mismatch_fails_even_without_greedy_policy(tmp_path: Path):
+    records_a = [make_record("p1", ["a", "b"], backend="mrv1", temperature=0.0)]
+    records_b = [make_record("p1", ["a", "b"], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--no-greedy-require-exact")
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "temperature differs" in report
+
+
+def test_collect_request_failure_writes_out_and_exits_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    prompts = write_jsonl(tmp_path / "prompts.jsonl", [{"id": "p1", "prompt": "hello", "max_tokens": 8}])
+    out = tmp_path / "collected.jsonl"
+    monkeypatch.setenv(ENV_VAR, "0")
+
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(compare_tool, "post_completion", boom)
+
+    code = compare_tool.main(
+        ["collect", "--backend", "mrv1", "--model", "GLM-5.1", "--requests", str(prompts), "--out", str(out)]
+    )
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "produced no tokens" in capsys.readouterr().err
+    records = compare_tool.load_jsonl(out)
+    assert len(records) == 1
+    assert records[0]["parsed_ok"] is False
+    assert records[0]["tokens"] == []
+    assert records[0]["logprobs"] == []
+    assert "URLError" in records[0]["error"]
+
+
+def test_negative_max_logprob_delta_is_input_error(tmp_path: Path, capsys: pytest.CaptureFixture):
+    path_a, path_b = write_pair(tmp_path, [make_record("p1", ["a"])], [make_record("p1", ["a"], backend="mrv2")])
+    out = tmp_path / "report.md"
+
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--max-logprob-delta", "-0.1"]
+    )
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "must not be negative" in capsys.readouterr().err
+    assert not out.exists()

@@ -36,6 +36,25 @@ prompt_sha1, temperature, tokens, logprobs, finish_reason, parsed_ok}`` (plus
 whether the greedy exact-match rule applies, so it treats a record without one
 as unusable input.
 
+Logprobs are compared only at positions where both runs emitted the same token;
+a position whose tokens differ is reported as non-comparable and never fails a
+run, because a non-greedy sample legitimately diverges there.
+
+Failure semantics:
+
+* ``collect`` unusable input or environment (``VLLM_USE_V2_MODEL_RUNNER`` missing or
+  contradicting ``--backend``, unreadable prompt file, missing ``--out``) ->
+  exit 2, **no output file is written**.
+* ``collect`` request-level failure (HTTP error, timeout, response without
+  tokens or logprobs) -> the JSONL **is** written, the record keeps
+  ``parsed_ok: false`` plus an ``error`` message, exit 1.
+* ``compare`` unusable input (unreadable file, malformed JSONL, missing or
+  duplicate field/id, unknown ``--out`` suffix, negative threshold) -> exit 2,
+  **no report file is written**.
+* ``compare`` parity failure (token divergence under greedy, logprob delta over
+  the threshold, ``parsed_ok`` false, configuration mismatch) -> the report **is**
+  written, exit 1.
+
 Exit codes: ``0`` parity holds (every request was collected), ``1`` parity is
 broken, ``2`` the input or the environment is unusable.
 """
@@ -225,14 +244,84 @@ def first_divergence(tokens_a: list[str], tokens_b: list[str]) -> int:
     return min(len(tokens_a), len(tokens_b))
 
 
+def escape_token(token: str) -> str:
+    """Render one token so it cannot break a Markdown table cell."""
+    return token.replace("|", "\\|").replace("\n", "\\n")
+
+
 def token_fragment(tokens: list[str], position: int) -> str:
     """Short window of decoded tokens around a divergence, safe inside a Markdown table."""
     start = max(0, position - FRAGMENT_RADIUS)
     stop = min(len(tokens), position + FRAGMENT_RADIUS + 1)
-    window = " | ".join(token.replace("|", "\\|").replace("\n", "\\n") for token in tokens[start:stop])
+    window = " | ".join(escape_token(token) for token in tokens[start:stop])
     prefix = "..." if start > 0 else ""
     suffix = "..." if stop < len(tokens) else ""
     return f"{prefix}{window}{suffix}"
+
+
+@dataclass
+class IncomparablePosition:
+    """One aligned position whose tokens differ, so its logprobs are not comparable."""
+
+    position: int
+    token_a: str
+    token_b: str
+
+
+@dataclass
+class LogprobStats:
+    """Logprob agreement measured on the positions both runs call comparable."""
+
+    positions: int = 0
+    delta_sum: float = 0.0
+    max_delta: float | None = None
+    incomparable: list[IncomparablePosition] = field(default_factory=list)
+
+
+def compare_logprobs(
+    record_id: str,
+    tokens_a: list[str],
+    tokens_b: list[str],
+    logprobs_a: list[float | None],
+    logprobs_b: list[float | None],
+    max_logprob_delta: float,
+    failures: list[str],
+) -> LogprobStats:
+    """Compare logprobs only where both runs emitted the same token.
+
+    A position whose tokens differ is not comparable: the two values belong to
+    different random variables, so their difference says nothing about parity.
+    Those positions are reported instead of failing the run, which is what makes
+    a legitimately diverging non-greedy sample comparable at all.
+    """
+    stats = LogprobStats()
+    deltas: list[tuple[int, float]] = []
+    missing: list[int] = []
+    for position, (token_a, token_b, value_a, value_b) in enumerate(
+        zip(tokens_a, tokens_b, logprobs_a, logprobs_b, strict=False)
+    ):
+        if token_a != token_b:
+            stats.incomparable.append(IncomparablePosition(position, token_a, token_b))
+            continue
+        if value_a is None and value_b is None:
+            continue
+        if value_a is None or value_b is None:
+            missing.append(position)
+            continue
+        deltas.append((position, abs(float(value_a) - float(value_b))))
+    if missing:
+        failures.append(f"{record_id}: logprob present on one side only at position(s) {missing[:MAX_LISTED_ITEMS]}")
+    oversized = [(position, delta) for position, delta in deltas if delta > max_logprob_delta]
+    if oversized:
+        position, delta = oversized[0]
+        failures.append(
+            f"{record_id}: logprob delta {delta:.6f} at position {position} exceeds "
+            f"--max-logprob-delta {max_logprob_delta} ({len(oversized)} comparable position(s) over threshold)"
+        )
+    stats.positions = len(deltas)
+    stats.delta_sum = sum(delta for _, delta in deltas)
+    stats.max_delta = max((delta for _, delta in deltas), default=None)
+    return stats
 
 
 @dataclass
@@ -253,6 +342,7 @@ class TokenDiff:
     divergence_at: int | None = None
     fragment_a: str = ""
     fragment_b: str = ""
+    incomparable: list[IncomparablePosition] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
 
@@ -280,6 +370,15 @@ def compare_record(
             f"{record_id}: expected backend mrv1 in --a and mrv2 in --b, got "
             f"{record_a['backend']!r}/{record_b['backend']!r}"
         )
+    if (
+        has_temperature(record_a)
+        and has_temperature(record_b)
+        and float(record_a["temperature"]) != float(record_b["temperature"])
+    ):
+        failures.append(
+            f"{record_id}: temperature differs (--a={record_a['temperature']!r}, "
+            f"--b={record_b['temperature']!r}); the two runs are not the same configuration"
+        )
     if greedy_require_exact:
         for label, record in (("--a", record_a), ("--b", record_b)):
             if not has_temperature(record):
@@ -302,29 +401,15 @@ def compare_record(
                 f"{record_id}: greedy generation diverged at token {divergence_at} (a={fragment_a!r}, b={fragment_b!r})"
             )
 
-    compared = min(len(tokens_a), len(tokens_b))
-    logprobs_a = record_a["logprobs"][:compared]
-    logprobs_b = record_b["logprobs"][:compared]
-    deltas: list[tuple[int, float]] = []
-    missing_positions: list[int] = []
-    for position, (value_a, value_b) in enumerate(zip(logprobs_a, logprobs_b, strict=False)):
-        if value_a is None and value_b is None:
-            continue
-        if value_a is None or value_b is None:
-            missing_positions.append(position)
-            continue
-        deltas.append((position, abs(float(value_a) - float(value_b))))
-    if missing_positions:
-        failures.append(
-            f"{record_id}: logprob present on one side only at position(s) {missing_positions[:MAX_LISTED_ITEMS]}"
-        )
-    oversized = [(position, delta) for position, delta in deltas if delta > max_logprob_delta]
-    if oversized:
-        position, delta = oversized[0]
-        failures.append(
-            f"{record_id}: logprob delta {delta:.6f} at position {position} exceeds "
-            f"--max-logprob-delta {max_logprob_delta} ({len(oversized)} position(s) over threshold)"
-        )
+    logprob_stats = compare_logprobs(
+        record_id,
+        tokens_a,
+        tokens_b,
+        record_a["logprobs"],
+        record_b["logprobs"],
+        max_logprob_delta,
+        failures,
+    )
     return TokenDiff(
         record_id=record_id,
         greedy=greedy,
@@ -333,13 +418,14 @@ def compare_record(
         exact_tokens=exact_tokens,
         position_total=position_total,
         position_matches=position_matches,
-        logprob_positions=len(deltas),
-        logprob_delta_sum=sum(delta for _, delta in deltas),
-        max_logprob_delta=max((delta for _, delta in deltas), default=None),
+        logprob_positions=logprob_stats.positions,
+        logprob_delta_sum=logprob_stats.delta_sum,
+        max_logprob_delta=logprob_stats.max_delta,
         parsed_ok=parsed_ok,
         divergence_at=divergence_at,
         fragment_a=fragment_a,
         fragment_b=fragment_b,
+        incomparable=logprob_stats.incomparable,
         failures=failures,
     )
 
@@ -430,6 +516,7 @@ def summarize(report: ComparisonReport) -> dict[str, Any]:
         "non_greedy_records": len(sampled),
         "non_greedy_exact_token_match_rate": _rate(sum(1 for diff in sampled if diff.exact_tokens), len(sampled)),
         "mean_token_match_rate": _rate(position_matches, position_total),
+        "incomparable_positions": sum(len(diff.incomparable) for diff in report.diffs),
         "max_logprob_delta": max_delta,
         "mean_logprob_delta": _rate(logprob_delta_sum, logprob_positions),
         "parsed_ok_rate": _rate(sum(1 for diff in report.diffs if diff.parsed_ok), len(report.diffs)),
@@ -461,6 +548,9 @@ def report_to_dict(report: ComparisonReport, metrics: dict[str, Any]) -> dict[st
                 "divergence_at": diff.divergence_at,
                 "fragment_a": diff.fragment_a,
                 "fragment_b": diff.fragment_b,
+                "incomparable": [
+                    {"position": item.position, "a": item.token_a, "b": item.token_b} for item in diff.incomparable
+                ],
                 "failures": diff.failures,
             }
             for diff in report.diffs
@@ -491,23 +581,27 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         f"| non-greedy exact match rate ({metrics['non_greedy_records']} record(s)) "
         f"| {_format_rate(metrics['non_greedy_exact_token_match_rate'])} |",
         f"| mean per-token match rate | {_format_rate(metrics['mean_token_match_rate'])} |",
+        f"| non-comparable positions (tokens differ) | {metrics['incomparable_positions']} |",
         f"| max logprob delta | {_format_delta(metrics['max_logprob_delta'])} |",
         f"| mean logprob delta | {_format_delta(metrics['mean_logprob_delta'])} |",
         f"| parsed_ok rate | {_format_rate(metrics['parsed_ok_rate'])} |",
         f"| missing ids | {_preview(report.missing_ids) if report.missing_ids else 'none'} |",
         f"| unexpected ids | {_preview(report.unexpected_ids) if report.unexpected_ids else 'none'} |",
         "",
+        "Logprob deltas are measured on comparable positions only: positions where the two runs",
+        "emitted different tokens are listed under 'Non-comparable positions' and never fail a run.",
+        "",
         "## Records",
         "",
-        "| id | greedy | tokens (a/b) | exact | pos match | max logprob delta | parsed_ok | verdict |",
-        "|---|---|---|---|---|---|---|---|",
+        "| id | greedy | tokens (a/b) | exact | pos match | non-comparable | max logprob delta | parsed_ok | verdict |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for diff in report.diffs:
         verdict = "PASS" if not diff.failures else "FAIL"
         pos_match = _format_rate(_rate(diff.position_matches, diff.position_total))
         lines.append(
             f"| `{diff.record_id}` | {'yes' if diff.greedy else 'no'} | {diff.tokens_a}/{diff.tokens_b} "
-            f"| {'yes' if diff.exact_tokens else 'no'} | {pos_match} "
+            f"| {'yes' if diff.exact_tokens else 'no'} | {pos_match} | {len(diff.incomparable)} "
             f"| {_format_delta(diff.max_logprob_delta)} | {'yes' if diff.parsed_ok else 'no'} | {verdict} |"
         )
     lines += ["", "## Token divergences", ""]
@@ -522,6 +616,21 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
             lines += ["", "Greedy records must match exactly; non-greedy records are listed for information only."]
     else:
         lines.append("No token divergence between the two runs.")
+    lines += ["", "## Non-comparable positions", ""]
+    incomparable = [(diff.record_id, item) for diff in report.diffs for item in diff.incomparable]
+    if incomparable:
+        lines += ["| id | position | a token | b token |", "|---|---|---|---|"]
+        lines += [
+            f"| `{record_id}` | {item.position} | `{escape_token(item.token_a)}` | `{escape_token(item.token_b)}` |"
+            for record_id, item in incomparable
+        ]
+        lines += [
+            "",
+            "Tokens differ at these positions, so the two logprobs are not the same random variable;",
+            "the delta is skipped and the position never makes a run fail.",
+        ]
+    else:
+        lines.append("Every aligned position carries the same token in both runs.")
     lines += ["", "## Failures", ""]
     lines += [f"- {failure}" for failure in report.failures] if report.failures else ["None."]
     lines += ["", f"## Verdict: {'PASS' if report.passed else 'FAIL'}", ""]
@@ -554,7 +663,8 @@ def run_compare(args: argparse.Namespace) -> int:
         f"(a={metrics['records_a']}, b={metrics['records_b']}); "
         f"exact token match rate {_format_rate(metrics['exact_token_match_rate'])}; "
         f"max logprob delta {_format_delta(metrics['max_logprob_delta'])} "
-        f"(allowed {report.max_logprob_delta})"
+        f"(allowed {report.max_logprob_delta}); "
+        f"{metrics['incomparable_positions']} non-comparable position(s)"
     )
     if report.failures:
         print(f"failures: {len(report.failures)}")
