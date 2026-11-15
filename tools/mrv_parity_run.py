@@ -120,6 +120,7 @@ STUB_LOG_MODES = ("explicit", "unset", "fallback", "both")
 STUB_PROMPT_TOKENS = ("stub", "token", "one", "two")
 STUB_PROMPT_LOGPROBS = (-0.1, -0.2, -0.3, -0.4)
 HEALTH_POLL_SECONDS = 0.2
+RESERVED_VARIABLES = (RUNNER_ENV, "SERVER_PORT", "PORT", "BACKEND", "CONFIG")
 LIVE_PROCESSES: set[Any] = set()
 EXAMPLES = """examples:
   python tools/mrv_parity_run.py rehearse --stub --data-dir /tmp/t4rehearse
@@ -233,6 +234,7 @@ class BackendRun:
     ignored_commands: int = 0
     missing_placeholders: list[dict[str, Any]] = field(default_factory=list)
     unresolved_variables: list[dict[str, Any]] = field(default_factory=list)
+    resolved_from_environ: list[str] = field(default_factory=list)
 
 
 class Executor:
@@ -380,19 +382,6 @@ def config_env(text: str) -> dict[str, str]:
     return {}
 
 
-def render_placeholders(template: str, variables: dict[str, str]) -> tuple[str, list[str]]:
-    """Fill `${NAME}` placeholders; return the missing names instead of leaving gaps."""
-    missing = sorted({match.group("name") for match in PLACEHOLDER_PATTERN.finditer(template)} - set(variables))
-    if missing:
-        return template, missing
-    return PLACEHOLDER_PATTERN.sub(lambda match: variables[match.group("name")], template), []
-
-
-def substitute_placeholders(template: str, variables: dict[str, str]) -> str:
-    """Fill every placeholder it can and leave the unknown ones visible for the scan."""
-    return PLACEHOLDER_PATTERN.sub(lambda match: variables.get(match.group("name"), match.group(0)), template)
-
-
 def top_scalar(text: str, key: str) -> str | None:
     """Value of one top level yaml scalar."""
     match = re.search(rf"(?m)^{re.escape(key)}:[ \t]*(?P<rest>[^\n#]*)", text)
@@ -443,11 +432,11 @@ def single_command_problem(
 
 def format_variable_problems(plan: ConfigPlan, backend: str, problems: list[dict[str, Any]]) -> str:
     """One message that names every missing placeholder and unresolved shell variable."""
-    placeholders = sorted({item["variable"] for item in problems if item["kind"] == "placeholder"})
+    placeholders = [item for item in problems if item["kind"] == "placeholder"]
     variables = [item for item in problems if item["kind"] == "variable"]
     parts: list[str] = []
     if placeholders:
-        parts.append(f"unresolved placeholder(s) {placeholders}; pass --var NAME=VALUE")
+        parts.append(f"unresolved placeholder(s) {json.dumps(placeholders)}; pass --var NAME=VALUE")
     if variables:
         parts.append(f"unresolved variable(s) {json.dumps(variables)}; pass --var NAME=VALUE or export them")
     return f"{plan.config_yaml or plan.slug} ({backend}): " + "; ".join(parts)
@@ -551,12 +540,88 @@ def record_command(
     )
 
 
-def render_environment(plan: ConfigPlan, port: int, backend: str, report: Any) -> dict[str, str]:
-    """Render the yaml env values and layer the allocated port and runner value on top."""
-    overrides = {name: report(f"env:{name}", value) for name, value in plan.env.items()}
-    overrides[RUNNER_ENV] = BACKEND_VALUES[backend]
-    overrides["SERVER_PORT"] = str(port)
-    return overrides
+class VariableResolver:
+    """Expand ``${VAR}`` and bare ``$VAR`` with --var > config env > os.environ precedence.
+
+    Env values reach the child process as a mapping, so no shell expands them:
+    this class is the only place that turns ``$PYTHON_LIB_DIR`` into a path.
+    A variable that references itself (``$LD_LIBRARY_PATH`` inside
+    ``LD_LIBRARY_PATH``) takes the previous ``os.environ`` value instead of
+    recursing, so prepending to a path cannot loop.
+    """
+
+    def __init__(self, variables: dict[str, str], config_env: dict[str, str], environ: Any) -> None:
+        self.variables = dict(variables)
+        self.raw = dict(config_env)
+        self.environ = environ
+        self.rendered: dict[str, str] = {}
+        self.problems: dict[str, list[tuple[str, str]]] = {}
+        self.resolved_from_environ: set[str] = set()
+        self.busy: set[str] = set()
+
+    def value_of(self, name: str, owner: str | None) -> str | None:
+        """Resolve one variable name; ``owner`` enables the self-reference rule."""
+        if name in self.variables:
+            return self.variables[name]
+        if name == owner:
+            value = self.environ.get(name)
+            if value is not None:
+                self.resolved_from_environ.add(name)
+            return value
+        if name in self.rendered:
+            return self.rendered[name]
+        if name in self.raw:
+            return self.render_env(name)
+        value = self.environ.get(name)
+        if value is not None:
+            self.resolved_from_environ.add(name)
+        return value
+
+    def render_env(self, key: str) -> str | None:
+        """Render one config env value, expanding the variables it references."""
+        if key in self.rendered:
+            return self.rendered[key]
+        if key in self.busy or key not in self.raw:
+            return None
+        self.busy.add(key)
+        text, missing = self.expand(self.raw[key], owner=key)
+        self.busy.discard(key)
+        self.problems[key] = missing
+        if missing:
+            return None
+        self.rendered[key] = text
+        return text
+
+    def expand(
+        self, text: str, owner: str | None = None, substitute_bare: bool = True
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Expand placeholders and optionally bare variables; report whatever is left."""
+        missing: list[tuple[str, str]] = []
+
+        def placeholder(match: Any) -> str:
+            value = self.value_of(match.group("name"), owner)
+            if value is None:
+                missing.append((match.group("name"), "placeholder"))
+                return match.group(0)
+            return value
+
+        expanded = PLACEHOLDER_PATTERN.sub(placeholder, text)
+
+        def bare(match: Any) -> str:
+            value = self.value_of(match.group("name"), owner)
+            if value is None:
+                missing.append((match.group("name"), "variable"))
+                return match.group(0)
+            return value if substitute_bare else match.group(0)
+
+        expanded = SHELL_VAR_PATTERN.sub(bare, expanded)
+        return expanded, missing
+
+    def render_all_env(self) -> tuple[dict[str, str], dict[str, list[tuple[str, str]]]]:
+        """Render every config env value; return the values plus the per-key problems."""
+        for key in self.raw:
+            self.render_env(key)
+        return dict(self.rendered), {key: value for key, value in self.problems.items() if value}
 
 
 def collect_command(plan: ConfigPlan, options: Options, run: BackendRun, base_url: str) -> list[str]:
@@ -588,42 +653,41 @@ def execute_backend(
     variables = dict(options.variables)
     variables.update(base_variables(run.port, run.backend))
     variables["CONFIG"] = str(plan.copies[run.backend])
-    env_keys = set(plan.env) | set(variables) | set(os.environ) | {RUNNER_ENV, "SERVER_PORT"}
+    resolver = VariableResolver(variables, plan.env, os.environ)
     problems: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
-    def report(location: str, template: str) -> str:
-        """Substitute what can be resolved and record everything the child cannot resolve."""
-        missing = sorted({match.group("name") for match in PLACEHOLDER_PATTERN.finditer(template)} - set(variables))
-        for name in missing:
-            record(name, location, "placeholder")
-        rendered = substitute_placeholders(template, variables)
-        for match in SHELL_VAR_PATTERN.finditer(rendered):
-            if match.group("name") not in env_keys:
-                record(match.group("name"), location, "variable")
-        return rendered
+    def record(entries: list[tuple[str, str]], location: str) -> None:
+        for name, kind in entries:
+            key = (name, location, kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            problems.append(
+                {
+                    "config": plan.config_yaml or plan.slug,
+                    "backend": run.backend,
+                    "variable": name,
+                    "location": location,
+                    "kind": kind,
+                }
+            )
 
-    def record(name: str, location: str, kind: str) -> None:
-        key = (name, location, kind)
-        if key in seen:
-            return
-        seen.add(key)
-        problems.append(
-            {
-                "config": plan.config_yaml or plan.slug,
-                "backend": run.backend,
-                "variable": name,
-                "location": location,
-                "kind": kind,
-            }
-        )
-
-    rendered = report("command", plan.commands[run.backend])
+    rendered, missing = resolver.expand(plan.commands[run.backend], substitute_bare=False)
     run.rendered = rendered
-    health_url = report("health", options.health_url)
-    base_url = report("base", options.base_url)
-    overrides = render_environment(plan, run.port, run.backend, report)
+    record(missing, "command")
+    health_url, missing = resolver.expand(options.health_url, substitute_bare=False)
+    record(missing, "health")
+    base_url, missing = resolver.expand(options.base_url, substitute_bare=False)
+    record(missing, "base")
+    rendered_env, env_problems = resolver.render_all_env()
+    for name, entries in env_problems.items():
+        record(entries, f"env:{name}")
+    overrides = {name: rendered_env.get(name, plan.env[name]) for name in plan.env}
+    overrides[RUNNER_ENV] = BACKEND_VALUES[run.backend]
+    overrides["SERVER_PORT"] = str(run.port)
     run.env_overrides = overrides
+    run.resolved_from_environ = sorted(resolver.resolved_from_environ)
     run.log_path = plan.data_dir / run.backend / "server.log"
     run.collect_path = plan.data_dir / run.backend / "collect.jsonl"
     run.collect_argv = collect_command(plan, options, run, base_url)
@@ -699,6 +763,7 @@ def build_manifest(
         for backend, run in runs.items()
     }
     manifest["command_count"] = plan.command_count
+    manifest["resolved_from_environ"] = sorted({name for run in runs.values() for name in run.resolved_from_environ})
     manifest["single_command_override"] = plan.single_command_override
     manifest["server_log_sha256_note"] = SERVER_LOG_SHA256_NOTE
     manifest["config_slug"] = plan.slug
@@ -748,6 +813,7 @@ def archive_dry_run(
         "single_command_override": plan.single_command_override,
         "ignored_commands": {run.backend: run.ignored_commands for run in runs.values()},
         "unresolved_variables": unresolved,
+        "resolved_from_environ": sorted({name for run in runs.values() for name in run.resolved_from_environ}),
         "plan_argv": [record["argv"] for record in records if record["stage"] == "plan"],
         "backends": [
             {
@@ -769,6 +835,7 @@ def archive_dry_run(
                 "collect": str(run.collect_path),
                 "ignored_commands": run.ignored_commands,
                 "unresolved_variables": run.missing_placeholders + run.unresolved_variables,
+                "resolved_from_environ": run.resolved_from_environ,
             }
             for run in runs.values()
         ],
@@ -823,6 +890,8 @@ def parse_variables(pairs: list[str]) -> dict[str, str]:
         name, separator, value = pair.partition("=")
         if not separator or not name:
             raise InputError(f"--var expects NAME=VALUE, got {pair!r}")
+        if name in RESERVED_VARIABLES:
+            raise InputError(f"--var {name} is reserved ({', '.join(RESERVED_VARIABLES)}); the executor owns that name")
         variables[name] = value
     return variables
 

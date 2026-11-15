@@ -294,15 +294,17 @@ def test_ports_follow_port_base_and_never_collide():
     assert len(ports) == 6
 
 
-def test_render_placeholders_fills_the_template():
-    rendered, missing = parity.render_placeholders("vllm serve org/model --port ${PORT}", {"PORT": "8000"})
+def test_resolver_fills_placeholders_from_the_variable_map():
+    resolver = parity.VariableResolver({"PORT": "8000"}, {}, {})
+    rendered, missing = resolver.expand("vllm serve org/model --port ${PORT}")
     assert (rendered, missing) == ("vllm serve org/model --port 8000", [])
 
 
-def test_render_placeholders_reports_every_missing_name():
-    rendered, missing = parity.render_placeholders("--port ${PORT} --tp ${TP_SIZE} ${TP_SIZE}", {})
-    assert rendered == "--port ${PORT} --tp ${TP_SIZE} ${TP_SIZE}"
-    assert missing == ["PORT", "TP_SIZE"]
+def test_resolver_reports_every_missing_placeholder():
+    resolver = parity.VariableResolver({}, {}, {})
+    rendered, missing = resolver.expand("--port ${PORT} --tp ${TP_SIZE}")
+    assert rendered == "--port ${PORT} --tp ${TP_SIZE}"
+    assert missing == [("PORT", "placeholder"), ("TP_SIZE", "placeholder")]
 
 
 def test_missing_placeholder_aborts_before_any_launch(tmp_path, monkeypatch):
@@ -811,3 +813,108 @@ def test_real_layerwise_dry_run_lists_the_env_variable(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "PYTHON_LIB_DIR" in captured.out
     assert "serve commands" in captured.err
+
+
+def test_env_value_bare_variable_is_expanded_for_the_child(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/old")
+    plan = make_plan(tmp_path, env={"LD_LIBRARY_PATH": "$PYTHON_LIB_DIR:/usr/local/lib:$LD_LIBRARY_PATH"})
+    executor = FakeExecutor()
+    options = make_options(tmp_path, variables={"PYTHON_LIB_DIR": "/opt"})
+    assert parity.execute_config(plan, options, executor) == 0
+    assert executor.launch_envs[0]["LD_LIBRARY_PATH"] == "/opt:/usr/local/lib:/old"
+
+
+def test_env_value_missing_variable_aborts_with_the_env_location(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    monkeypatch.delenv("PYTHON_LIB_DIR", raising=False)
+    plan = make_plan(tmp_path, env={"LD_LIBRARY_PATH": "$PYTHON_LIB_DIR:/usr/local/lib"})
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    reason = read_manifest(plan)["abort_reason"]
+    assert "PYTHON_LIB_DIR" in reason
+    assert "env:LD_LIBRARY_PATH" in reason
+    assert executor.launches == []
+
+
+def test_plain_env_values_are_passed_through_unchanged(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    env = {"HCCL_BUFFSIZE": "1024", "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True"}
+    plan = make_plan(tmp_path, env=env)
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 0
+    captured = executor.launch_envs[0]
+    for key, value in env.items():
+        assert captured[key] == value
+
+
+def test_env_value_can_reference_another_config_env_key(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, env={"BASE_DIR": "/opt/lib", "LD_LIBRARY_PATH": "$BASE_DIR:/usr/local/lib"})
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 0
+    assert executor.launch_envs[0]["LD_LIBRARY_PATH"] == "/opt/lib:/usr/local/lib"
+
+
+def test_config_env_placeholder_in_the_command_is_rendered(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --host ${HOST_IP}", env={"HOST_IP": "10.0.0.5"})
+    assert parity.execute_config(plan, make_options(tmp_path, dry_run=True), FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "--host 10.0.0.5" in payload["backends"][0]["serve_command"]
+
+
+def test_placeholder_resolves_from_os_environ(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    monkeypatch.setenv("ONLY_ENV", "42")
+    plan = make_plan(tmp_path, command="vllm serve org/model --seed ${ONLY_ENV}")
+    assert parity.execute_config(plan, make_options(tmp_path, dry_run=True), FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backends"][0]["serve_command"].endswith("--seed 42")
+    assert "ONLY_ENV" in payload["resolved_from_environ"]
+
+
+def test_bare_command_variable_resolves_from_os_environ(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    monkeypatch.setenv("LOCAL_IP", "10.0.0.1")
+    plan = make_plan(tmp_path, command="vllm serve org/model --host $LOCAL_IP")
+    assert parity.execute_config(plan, make_options(tmp_path, dry_run=True), FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unresolved_variables"] == []
+    assert "LOCAL_IP" in payload["resolved_from_environ"]
+
+
+def test_placeholder_error_carries_the_location(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --tp ${TP_SIZE}")
+    assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 2
+    reason = read_manifest(plan)["abort_reason"]
+    assert "TP_SIZE" in reason
+    assert '"location": "command"' in reason
+
+
+def test_var_cannot_override_a_reserved_name(tmp_path, capsys):
+    with pytest.raises(parity.InputError, match="reserved"):
+        parity.parse_variables(["SERVER_PORT=1"])
+    argv = [
+        "run",
+        "--configs",
+        "glm-5.2-W4A8C8-DSpark-PCP",
+        "--dest",
+        str(tmp_path / "dest"),
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--dry-run",
+        "--var",
+        f"{parity.RUNNER_ENV}=1",
+    ]
+    assert parity.main(argv) == 2
+    assert "reserved" in capsys.readouterr().err
+
+
+def test_manifest_records_the_variables_read_from_the_environment(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    monkeypatch.setenv("ONLY_ENV", "42")
+    plan = make_plan(tmp_path, command="vllm serve org/model --seed ${ONLY_ENV}")
+    assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 0
+    assert read_manifest(plan)["resolved_from_environ"] == ["ONLY_ENV"]
