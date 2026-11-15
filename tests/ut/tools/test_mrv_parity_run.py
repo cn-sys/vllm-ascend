@@ -1,0 +1,592 @@
+import json
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from tools import mrv_parity_run as parity
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+GLM_DIR = "tests/e2e/cases/models/configs/GLM"
+DEPLOYMENT_CONFIG = f"{GLM_DIR}/GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml"
+PROMPTS = (
+    '{"id":"p1","prompt":"hello","max_tokens":4,"temperature":0}\n'
+    '{"id":"p2","prompt":"world","max_tokens":4,"temperature":0}\n'
+)
+ENV_FIXTURE = """test_name: "fake"
+model: "org/model"
+env_common: &env_common
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  SERVER_PORT: "8080"
+  HCCL_BUFFSIZE: "1024"
+deployment:
+  - envs:
+      <<: *env_common
+    server_cmd: >
+      vllm serve org/model
+      --port $SERVER_PORT
+"""
+CASE_FIXTURE = """test_cases:
+  - name: "case"
+    model: "org/model"
+    envs:
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      SERVER_PORT: "8080"
+    server_cmd:
+      - "--port"
+      - "$SERVER_PORT"
+"""
+ALIAS_FIXTURE = """test_name: "fake"
+_envs: &envs
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  SERVER_PORT: "8080"
+test_cases:
+  - name: "case"
+    model: "org/model"
+    envs: *envs
+    server_cmd:
+      - "--port"
+      - "$SERVER_PORT"
+"""
+
+
+def write_prompts(tmp_path: Path) -> Path:
+    path = tmp_path / "prompts.jsonl"
+    path.write_text(PROMPTS, encoding="utf-8")
+    return path
+
+
+def free_port_pair() -> int:
+    """Two consecutive free loopback ports, because port_for uses base and base+1."""
+    for _ in range(50):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            base = sock.getsockname()[1]
+        if not parity.port_is_open(base) and not parity.port_is_open(base + 1):
+            return base
+    raise RuntimeError("no free consecutive ports")
+
+
+class FakeProcess:
+    """Stand-in for a Popen object."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+class FakeExecutor(parity.Executor):
+    """Records every call and answers with canned results; never spawns anything."""
+
+    def __init__(
+        self, *, gate_rc: int = 0, collect_rc: int = 0, compare_rc: int = 0, log_text: str = "explicit\n"
+    ) -> None:
+        self.gate_rc = gate_rc
+        self.collect_rc = collect_rc
+        self.compare_rc = compare_rc
+        self.log_text = log_text
+        self.calls: list[str] = []
+        self.launches: list[tuple[str, int]] = []
+        self.stops = 0
+        self.plan_payload: dict | None = None
+
+    def stage_of(self, argv: list[str]) -> str:
+        if "mrv_dual_run" in Path(argv[1]).name:
+            return argv[2] if len(argv) > 2 else "?"
+        return argv[2] if len(argv) > 2 else "?"
+
+    def run(self, argv, cwd, env=None, timeout=None) -> parity.CommandResult:
+        stage = self.stage_of(argv)
+        self.calls.append(stage)
+        if stage == "plan":
+            return parity.CommandResult(0, json.dumps(self.plan_payload or {"configs": []}), "")
+        if stage == "verify-log":
+            return parity.CommandResult(self.gate_rc, "log line\n", "" if self.gate_rc == 0 else "gate error")
+        if stage == "collect":
+            out = Path(argv[argv.index("--out") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if self.collect_rc == 0:
+                out.write_text('{"id":"p1"}\n{"id":"p2"}\n', encoding="utf-8")
+            return parity.CommandResult(self.collect_rc, "", "" if self.collect_rc == 0 else "collect error")
+        if stage == "compare":
+            out = Path(argv[argv.index("--out") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("report\n", encoding="utf-8")
+            return parity.CommandResult(self.compare_rc, "", "")
+        return parity.CommandResult(0, "", "")
+
+    def launch(self, rendered, cwd, env, log_path, port) -> parity.Launch:
+        self.launches.append((rendered, port))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(self.log_text, encoding="utf-8")
+        return parity.Launch(FakeProcess(), log_path)
+
+    def stop(self, launch, grace) -> int | None:
+        self.stops += 1
+        launch.process.returncode = 0
+        return 0
+
+
+def make_options(tmp_path: Path, *, dry_run: bool = False, variables: dict[str, str] | None = None) -> parity.Options:
+    return parity.Options(
+        dest=tmp_path / "dest",
+        requests=tmp_path / "prompts.jsonl",
+        health_url=parity.DEFAULT_HEALTH_URL,
+        base_url=parity.DEFAULT_BASE_URL,
+        port_base=18000,
+        readiness_timeout=1.0,
+        collect_timeout=10.0,
+        stop_grace=2.0,
+        variables={} if variables is None else variables,
+        dry_run=dry_run,
+    )
+
+
+def make_plan(
+    tmp_path: Path, command: str = "vllm serve org/model --port ${PORT}", env: dict | None = None
+) -> parity.ConfigPlan:
+    return parity.ConfigPlan(
+        slug="fake-config",
+        index=0,
+        data_dir=tmp_path / "data",
+        config_yaml="tests/e2e/cases/models/configs/GLM/fake.yaml",
+        model="org/model",
+        commands={"mrv1": command, "mrv2": command},
+        copies={"mrv1": tmp_path / "copy.yaml", "mrv2": tmp_path / "copy.yaml"},
+        env={} if env is None else env,
+    )
+
+
+def no_http(monkeypatch) -> None:
+    monkeypatch.setattr(parity, "wait_for_health", lambda url, process, timeout: 0.0)
+    monkeypatch.setattr(parity, "port_is_open", lambda port: False)
+
+
+def read_manifest(plan: parity.ConfigPlan) -> dict:
+    return json.loads((plan.data_dir / "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_dry_run_prints_the_sequence_and_never_launches(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --port ${PORT} --seed 1024")
+    options = make_options(tmp_path, dry_run=True)
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, options, executor) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert executor.launches == []
+    assert executor.calls == []
+    assert not (plan.data_dir / "manifest.json").exists()
+    for backend, entry in zip(parity.BACKENDS, payload["backends"], strict=True):
+        assert entry["backend"] == backend
+        assert entry["port"] == options.port_base + parity.BACKENDS.index(backend)
+        assert entry["serve_command"].startswith("vllm serve org/model")
+        assert entry["env_overrides"]["SERVER_PORT"] == str(entry["port"])
+        assert entry["env_overrides"][parity.RUNNER_ENV] == parity.BACKEND_VALUES[backend]
+        assert entry["gate_argv"][2] == "verify-log"
+        assert entry["collect_argv"][2] == "collect"
+        assert Path(entry["server_log"]).parent.name == backend
+        assert Path(entry["server_log"]).name == "server.log"
+
+
+def test_gate_failure_aborts_before_collect_and_writes_no_collect_file(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    options = make_options(tmp_path)
+    executor = FakeExecutor(gate_rc=1)
+    assert parity.execute_config(plan, options, executor) == 2
+    manifest = read_manifest(plan)
+    assert "gate failed" in manifest["abort_reason"]
+    assert executor.calls == ["verify-log"]
+    assert manifest["backends"]["mrv1"]["collect_exit"] is None
+    assert not (plan.data_dir / "mrv1" / "collect.jsonl").exists()
+    assert not (plan.data_dir / "mrv2" / "collect.jsonl").exists()
+    assert "compare" not in executor.calls
+
+
+def test_gate_runs_before_collect_for_each_backend(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 0
+    assert executor.calls == ["verify-log", "collect", "verify-log", "collect", "compare", "compare"]
+
+
+def test_collect_failure_aborts_the_run(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(collect_rc=1)
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    manifest = read_manifest(plan)
+    assert "collect failed" in manifest["abort_reason"]
+    assert executor.calls == ["verify-log", "collect"]
+    assert "mrv2" not in manifest["backends"]
+
+
+def test_compare_mismatch_is_a_result_and_exits_one(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(compare_rc=1)
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 1
+    manifest = read_manifest(plan)
+    assert manifest["compare_exit"] == 1
+    assert manifest["abort_reason"] is None
+
+
+def test_compare_input_error_aborts(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(compare_rc=2)
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    assert "compare failed" in read_manifest(plan)["abort_reason"]
+
+
+def test_manifest_carries_the_plan_fields_and_per_backend_facts(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 0
+    manifest = read_manifest(plan)
+    for field in parity.MANIFEST_FIELDS:
+        assert field in manifest
+    assert manifest["image_tag"] is None and manifest["cann_version"] is None
+    assert manifest["backend_expected"] == ["mrv1", "mrv2"]
+    assert manifest["config_yaml"].endswith("fake.yaml")
+    assert manifest["compare_exit"] == 0
+    for backend in parity.BACKENDS:
+        entry = manifest["backends"][backend]
+        assert entry["readiness_s"] == 0.0
+        assert entry["exit_status"] == 0
+        assert entry["log_sha256"] == parity.sha256_file(plan.data_dir / backend / "server.log")
+        assert entry["collect_records"] == 2
+    stages = [record["stage"] for record in manifest["commands"]]
+    assert stages == ["verify-log", "collect", "verify-log", "collect", "compare", "compare"]
+    assert all(record["argv"] for record in manifest["commands"])
+
+
+def test_manifest_log_sha256_matches_the_file(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(log_text="some log body\n")
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 0
+    expected = parity.sha256_file(plan.data_dir / "mrv2" / "server.log")
+    assert read_manifest(plan)["backends"]["mrv2"]["log_sha256"] == expected
+
+
+def test_ports_follow_port_base_and_never_collide():
+    assert parity.port_for(8000, 0, "mrv1") == 8000
+    assert parity.port_for(8000, 0, "mrv2") == 8001
+    assert parity.port_for(8000, 1, "mrv1") == 8002
+    ports = {parity.port_for(8000, index, backend) for index in range(3) for backend in parity.BACKENDS}
+    assert len(ports) == 6
+
+
+def test_render_placeholders_fills_the_template():
+    rendered, missing = parity.render_placeholders("vllm serve org/model --port ${PORT}", {"PORT": "8000"})
+    assert (rendered, missing) == ("vllm serve org/model --port 8000", [])
+
+
+def test_render_placeholders_reports_every_missing_name():
+    rendered, missing = parity.render_placeholders("--port ${PORT} --tp ${TP_SIZE} ${TP_SIZE}", {})
+    assert rendered == "--port ${PORT} --tp ${TP_SIZE} ${TP_SIZE}"
+    assert missing == ["PORT", "TP_SIZE"]
+
+
+def test_missing_placeholder_aborts_before_any_launch(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --tp ${TP_SIZE}")
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    assert executor.launches == []
+    assert "unresolved placeholder" in read_manifest(plan)["abort_reason"]
+
+
+def test_config_env_resolves_a_deployment_anchor():
+    assert parity.config_env(ENV_FIXTURE) == {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "SERVER_PORT": "8080",
+        "HCCL_BUFFSIZE": "1024",
+    }
+
+
+def test_config_env_resolves_an_inline_test_cases_block():
+    assert parity.config_env(CASE_FIXTURE) == {"VLLM_USE_V2_MODEL_RUNNER": "1", "SERVER_PORT": "8080"}
+
+
+def test_config_env_resolves_an_aliased_envs_block():
+    assert parity.config_env(ALIAS_FIXTURE)["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+def test_source_never_uses_a_shell_keyword_or_splits_a_command():
+    source = Path(parity.__file__).read_text(encoding="utf-8")
+    assert "shell=True" not in source
+    assert '["sh", "-c"' in source
+    assert "display.split" not in source
+    assert "rendered.split" not in source
+    assert not [line for line in source.splitlines() if ".split(" in line and "display" in line]
+
+
+def test_file_descriptor_module_shadow_is_avoided():
+    """Running this tool as a script must not let tools/bisect shadow the stdlib."""
+    source = Path(parity.__file__).read_text(encoding="utf-8")
+    assert "sys.path.pop(0)" in source
+    assert source.index("sys.path.pop(0)") < source.index("import urllib.request")
+
+
+def test_parse_variables_rejects_a_pair_without_a_name():
+    assert parity.parse_variables(["A=1"]) == {"A": "1"}
+    with pytest.raises(parity.InputError):
+        parity.parse_variables(["A"])
+
+
+def test_matches_slug_accepts_a_stem_or_a_suffix():
+    rel = f"{GLM_DIR}/GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml"
+    assert parity.matches_slug(rel, "GLM-5.2-W8A8C8-MTP-A5-dual-nodes")
+    assert parity.matches_slug(rel, rel)
+    assert not parity.matches_slug(rel, "GLM-5.2-W8A8C8-layerwise-PD")
+
+
+def test_stub_runner_lines_cover_the_three_modes():
+    assert parity.runner_log_lines("mrv2", "explicit") == ["VLLM_USE_V2_MODEL_RUNNER=1 is set; using Model Runner V2."]
+    assert "is unset" in parity.runner_log_lines("mrv1", "unset")[0]
+    assert "using the V1 model runner instead" in parity.runner_log_lines("mrv1", "fallback")[0]
+    assert len(parity.runner_log_lines("mrv1", "both")) == 2
+
+
+def test_stub_server_answers_health_and_completions():
+    port = free_port_pair()
+    tool = Path(parity.__file__).resolve()
+    process = subprocess.Popen(
+        [sys.executable, str(tool), "_stub-server", "--port", str(port), "--backend", "mrv1"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
+                    assert response.status == 200
+                break
+            except OSError:
+                time.sleep(0.1)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/completions",
+            data=b'{"prompt":"hi"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read())
+        assert payload["choices"][0]["logprobs"]["tokens"] == list(parity.STUB_PROMPT_TOKENS)
+    finally:
+        process.terminate()
+        process.wait(timeout=20)
+
+
+def test_rehearse_publishes_the_full_archive(tmp_path):
+    data = tmp_path / "data"
+    port = free_port_pair()
+    prompts = write_prompts(tmp_path)
+    assert (
+        parity.main(
+            [
+                "rehearse",
+                "--stub",
+                "--data-dir",
+                str(data),
+                "--requests",
+                str(prompts),
+                "--port-base",
+                str(port),
+            ]
+        )
+        == 0
+    )
+    for relative in (
+        "manifest.json",
+        "mrv1/server.log",
+        "mrv1/collect.jsonl",
+        "mrv2/server.log",
+        "mrv2/collect.jsonl",
+        "compare.md",
+        "compare.json",
+    ):
+        assert (data / relative).is_file(), relative
+    manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["compare_exit"] == 0
+    assert manifest["abort_reason"] is None
+    for backend in parity.BACKENDS:
+        assert manifest["backends"][backend]["collect_records"] == 2
+        assert manifest["backends"][backend]["log_sha256"]
+    assert "PASS" in (data / "compare.md").read_text(encoding="utf-8")
+
+
+def test_rehearse_aborts_on_an_unset_log(tmp_path):
+    data = tmp_path / "data"
+    port = free_port_pair()
+    assert (
+        parity.main(
+            [
+                "rehearse",
+                "--stub",
+                "--log-mode",
+                "unset",
+                "--data-dir",
+                str(data),
+                "--requests",
+                str(write_prompts(tmp_path)),
+                "--port-base",
+                str(port),
+            ]
+        )
+        == 2
+    )
+    manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
+    assert "NOT applied" in manifest["abort_reason"]
+    assert not (data / "mrv1" / "collect.jsonl").exists()
+    assert not (data / "mrv2" / "collect.jsonl").exists()
+
+
+def test_rehearse_aborts_on_a_fallback_log(tmp_path):
+    data = tmp_path / "data"
+    port = free_port_pair()
+    assert (
+        parity.main(
+            [
+                "rehearse",
+                "--stub",
+                "--log-mode",
+                "fallback",
+                "--data-dir",
+                str(data),
+                "--requests",
+                str(write_prompts(tmp_path)),
+                "--port-base",
+                str(port),
+            ]
+        )
+        == 2
+    )
+    manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
+    assert "fallback" in manifest["abort_reason"]
+    assert not (data / "mrv1" / "collect.jsonl").exists()
+    assert not parity.LIVE_PROCESSES
+
+
+def test_readiness_timeout_aborts_and_kills_the_server(tmp_path):
+    data = tmp_path / "data"
+    port = free_port_pair()
+    assert (
+        parity.main(
+            [
+                "rehearse",
+                "--stub",
+                "--serve-cmd",
+                "sleep 60",
+                "--readiness-timeout",
+                "1.0",
+                "--data-dir",
+                str(data),
+                "--requests",
+                str(write_prompts(tmp_path)),
+                "--port-base",
+                str(port),
+            ]
+        )
+        == 2
+    )
+    manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
+    assert "not ready" in manifest["abort_reason"]
+    assert not (data / "mrv1" / "collect.jsonl").exists()
+    assert not parity.LIVE_PROCESSES
+    assert not parity.port_is_open(port)
+
+
+def test_run_dry_run_on_a_real_config_writes_nothing(tmp_path, capsys):
+    data = tmp_path / "data"
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-MTP-A5-dual-nodes",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(data),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["config_yaml"] == DEPLOYMENT_CONFIG
+    assert len(payload["backends"]) == 2
+    assert payload["backends"][0]["env_overrides"]["SERVER_PORT"] == str(payload["backends"][0]["port"])
+    assert payload["backends"][0]["serve_command"].startswith("vllm serve Eco-Tech/GLM-5.2-W8A8C8-mxfp8")
+    assert not data.exists()
+
+
+def test_run_dry_run_reports_missing_placeholders(tmp_path, capsys):
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-layerwise-PD",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+    assert "unresolved placeholder" in capsys.readouterr().err
+    assert not (tmp_path / "data").exists()
+
+
+def test_load_plans_reads_the_plan_json_and_the_copy_env(tmp_path):
+    copy = tmp_path / "dest" / "mrv1" / "fake.yaml"
+    copy.parent.mkdir(parents=True)
+    copy.write_text(ENV_FIXTURE, encoding="utf-8")
+    executor = FakeExecutor()
+    executor.plan_payload = {
+        "configs": [
+            {
+                "path": "tests/e2e/cases/models/configs/GLM/fake.yaml",
+                "targets": {
+                    "mrv1": {
+                        "dest": str(copy),
+                        "commands": [{"display": "vllm serve org/model", "model": "org/model"}],
+                    },
+                    "mrv2": {
+                        "dest": str(copy),
+                        "commands": [{"display": "vllm serve org/model", "model": "org/model"}],
+                    },
+                },
+            }
+        ]
+    }
+    records: list[dict] = []
+    plans = parity.load_plans(["fake"], tmp_path / "data", make_options(tmp_path), executor, records)
+    assert [record["stage"] for record in records] == ["plan"]
+    assert len(plans) == 1
+    assert plans[0].model == "org/model"
+    assert plans[0].commands["mrv1"] == "vllm serve org/model"
+    assert plans[0].env["SERVER_PORT"] == "8080"
+    assert plans[0].data_dir == tmp_path / "data"
+    plan_argv = records[0]["argv"]
+    assert plan_argv[plan_argv.index("--only") + 1] == "fake.yaml"
