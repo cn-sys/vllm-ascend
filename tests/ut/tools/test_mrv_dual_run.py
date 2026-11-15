@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -126,6 +127,14 @@ NO_COMMAND_FIXTURE = """test_cases:
 LOG_MRV1 = "INFO (EngineCore_0 pid=1) VLLM_USE_V2_MODEL_RUNNER=0 is set; using Model Runner V1.\n"
 LOG_MRV2 = "INFO (EngineCore_0 pid=1) VLLM_USE_V2_MODEL_RUNNER=1 is set; using Model Runner V2.\n"
 LOG_FALLBACK = "WARNING Model Runner V2 does not yet support draft_model; using the V1 model runner instead.\n"
+LOG_UNSET = "INFO (EngineCore_0 pid=1) VLLM_USE_V2_MODEL_RUNNER is unset; using Model Runner V2 by default.\n"
+LOG_INCONSISTENT = "INFO (EngineCore_0 pid=1) VLLM_USE_V2_MODEL_RUNNER=0 is set; using Model Runner V2.\n"
+FLOW_FIXTURE = """test_cases:
+  - name: "flow"
+    envs: {VLLM_USE_V2_MODEL_RUNNER: "1"}
+    server_cmd:
+      - "--port"
+"""
 
 
 def write_text(path: Path, text: str) -> Path:
@@ -276,7 +285,7 @@ def test_plan_print_only_covers_all_configs_with_two_command_sets(capsys):
             assert state["value"] == dual.BACKEND_VALUES[target]
             assert state["dest"] is None
             assert state["commands"]
-            assert all(command["command"].startswith("vllm serve") for command in state["commands"])
+            assert all(command["display"].startswith("vllm serve") for command in state["commands"])
 
 
 def test_plan_marks_no_change_needed_per_target(capsys):
@@ -330,24 +339,66 @@ def test_plan_only_filters_to_one_config(capsys):
     assert [entry["path"] for entry in payload["configs"]] == [FEATURE_PP]
 
 
-@pytest.mark.parametrize(
-    ("log_text", "expected", "code"),
-    [
-        (LOG_MRV1, "mrv1", 0),
-        (LOG_MRV2, "mrv2", 0),
-        (LOG_MRV1, "mrv2", 1),
-        (LOG_FALLBACK, "mrv1", 2),
-        (LOG_MRV1 + LOG_MRV2, "mrv1", 1),
-    ],
-)
-def test_verify_log_three_state_matrix(tmp_path, capsys, log_text, expected, code):
+def run_verify(tmp_path, capsys, log_text: str, expect: str) -> tuple[int, str, str]:
     log = write_text(tmp_path / "server.log", log_text)
-    assert dual.main(["verify-log", "--log", str(log), "--expect", expected]) == code
+    code = dual.main(["verify-log", "--log", str(log), "--expect", expect])
     captured = capsys.readouterr()
-    if code == 0:
-        assert "using Model Runner" in captured.out
-    else:
-        assert captured.err
+    return code, captured.out, captured.err
+
+
+def test_verify_log_explicit_v2_passes_for_mrv2(tmp_path, capsys):
+    code, out, err = run_verify(tmp_path, capsys, LOG_MRV2, "mrv2")
+    assert (code, err) == (0, "")
+    assert "VLLM_USE_V2_MODEL_RUNNER=1 is set" in out
+
+
+def test_verify_log_explicit_v2_fails_for_mrv1(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, LOG_MRV2, "mrv1")
+    assert code == 1
+    assert "expected V1" in err
+
+
+def test_verify_log_unset_default_v2_fails_for_mrv2(tmp_path, capsys):
+    """Regression: 'is unset; using Model Runner V2 by default' used to pass == false green."""
+    code, _, err = run_verify(tmp_path, capsys, LOG_UNSET, "mrv2")
+    assert code == 1
+    assert "NOT applied" in err
+
+
+def test_verify_log_unset_default_v2_fails_for_mrv1(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, LOG_UNSET, "mrv1")
+    assert code == 1
+    assert "NOT applied" in err
+
+
+def test_verify_log_blacklist_fallback_fails_instead_of_missing(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, LOG_FALLBACK, "mrv1")
+    assert code == 1
+    assert "fallback" in err and "NOT applied" in err
+
+
+def test_verify_log_conflicting_explicit_lines_fail(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, LOG_MRV1 + LOG_MRV2, "mrv1")
+    assert code == 1
+    assert "contradictory" in err
+
+
+def test_verify_log_empty_log_is_an_input_error(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, "nothing to see here\n", "mrv2")
+    assert code == 2
+    assert "not a pass" in err
+
+
+def test_verify_log_fallback_line_is_not_read_as_explicit():
+    modes = [item["mode"] for item in dual.scan_runner_log(LOG_FALLBACK.splitlines())]
+    assert modes == ["fallback"]
+    assert all(item["mode"] != "explicit" for item in dual.scan_runner_log(LOG_FALLBACK.splitlines()))
+
+
+def test_verify_log_inconsistent_explicit_value_fails(tmp_path, capsys):
+    code, _, err = run_verify(tmp_path, capsys, LOG_INCONSISTENT, "mrv2")
+    assert code == 1
+    assert "contradicts" in err
 
 
 def test_verify_log_missing_file_is_an_input_error(tmp_path):
@@ -427,13 +478,15 @@ def test_manifest_refuses_a_missing_server_log(tmp_path):
     assert dual.main(["manifest", "--out", str(tmp_path / "m.json"), "--server-log", str(tmp_path / "absent.log")]) == 2
 
 
-def test_tool_imports_only_the_standard_library():
+def test_tool_imports_only_the_standard_library_and_the_regex_whitelist():
+    """The repository lint bans 'import re'; 'import regex as re' is the allowed spelling."""
     allowed = {
         "__future__",
         "argparse",
         "hashlib",
         "json",
-        "re",
+        "regex",
+        "shlex",
         "subprocess",
         "sys",
         "dataclasses",
@@ -445,7 +498,7 @@ def test_tool_imports_only_the_standard_library():
     modules = {node.module.split(".")[0] for node in tree.body if isinstance(node, ast.ImportFrom) and node.module}
     modules |= {alias.name.split(".")[0] for node in tree.body if isinstance(node, ast.Import) for alias in node.names}
     assert modules <= allowed
-    assert not modules & {"vllm", "torch", "yaml", "vllm_ascend"}
+    assert not modules & {"re", "vllm", "torch", "yaml", "vllm_ascend"}
 
 
 def test_ut_run_leaves_the_yaml_tree_clean():
@@ -457,3 +510,80 @@ def test_ut_run_leaves_the_yaml_tree_clean():
     )
     assert completed.returncode == 0
     assert completed.stdout.strip() == ""
+
+
+def test_discover_refuses_a_flow_style_pin(tmp_path, capsys):
+    """A flow mapping mentions the variable but cannot be read: fail, never skip silently."""
+    root, _ = fake_repo(tmp_path, "flow", FLOW_FIXTURE)
+    assert dual.main(["discover", "--repo-root", str(root)]) == 2
+    err = capsys.readouterr().err
+    assert "cannot be read" in err
+    assert "fixture.yaml" in err and "line(s) 3" in err
+
+
+def test_stray_pin_lines_ignores_comments():
+    assert dual.stray_pin_lines('  # VLLM_USE_V2_MODEL_RUNNER: "1"\n') == []
+    assert dual.stray_pin_lines('    envs: {VLLM_USE_V2_MODEL_RUNNER: "1"}\n') == [1]
+
+
+def test_command_record_returns_argv_when_the_display_round_trips():
+    record = dual.command_record("node-a", "vllm serve org/model --port 8000 --seed 1024", "test_cases[0].server_cmd")
+    assert record["argv"] == ["vllm", "serve", "org/model", "--port", "8000", "--seed", "1024"]
+    assert shlex.join(record["argv"]) == record["display"]
+    assert record["requires_runner_render"] is False
+    assert record["placeholders"] == []
+
+
+def test_command_record_refuses_argv_for_a_json_argument():
+    record = dual.command_record("node-a", 'vllm serve org/model --cudagraph-mode {"mode": "FULL"}', "fixture")
+    assert record["argv"] is None
+    assert record["requires_runner_render"] is True
+    assert record["placeholders"] == []
+
+
+def test_command_record_refuses_argv_and_lists_placeholders():
+    record = dual.command_record("node-a", "vllm serve org/model --port ${PORT} --tp ${TP_SIZE}", "fixture")
+    assert record["argv"] is None
+    assert record["placeholders"] == ["PORT", "TP_SIZE"]
+    assert record["requires_runner_render"] is True
+
+
+def test_plan_marks_the_json_config_as_requiring_runner_render(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    entry = next(item for item in payload["configs"] if item["path"].endswith("SFA-DCP.yaml"))
+    command = entry["targets"]["mrv1"]["commands"][0]
+    assert command["requires_runner_render"] is True
+    assert command["argv"] is None
+    assert "{" in command["display"] and '"' in command["display"]
+
+
+def test_plan_exposes_placeholders_for_the_four_external_configs(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    external = [entry for entry in payload["configs"] if entry["carrier"] == "external_templates"]
+    assert len(external) == 4
+    for entry in external:
+        for command in entry["targets"]["mrv1"]["commands"]:
+            assert command["placeholders"]
+            assert command["requires_runner_render"] is True
+            assert command["argv"] is None
+
+
+def test_plan_never_claims_an_argv_that_does_not_round_trip(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    for entry in payload["configs"]:
+        for state in entry["targets"].values():
+            for command in state["commands"]:
+                assert set(command) == {
+                    "node",
+                    "display",
+                    "argv",
+                    "requires_runner_render",
+                    "placeholders",
+                    "source",
+                    "model",
+                    "notes",
+                }
+                if command["argv"] is None:
+                    assert command["requires_runner_render"] is True
+                else:
+                    assert shlex.join(command["argv"]) == " ".join(command["display"].split())

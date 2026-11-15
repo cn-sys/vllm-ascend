@@ -23,10 +23,16 @@ cannot flip them: the copies below have to be rewritten. ``discover`` lists thos
 configs with line, value and carrier family; ``plan`` copies each into two trees
 under ``--dest`` (one per backend), rewrites only the pinned line and emits the
 serve commands; ``rewrite`` flips one file into a copy and proves that exactly
-that line changed; ``verify-log`` proves the runner from the server log line the
-Ascend plugin prints (``vllm_ascend/mrv2_utils.py``: ``... is set; using Model
-Runner V1|V2``), and a log without it fails instead of passing; ``manifest``
+that line changed; ``verify-log`` proves the runner from the server log the Ascend
+plugin prints (``vllm_ascend/mrv2_utils.py``), and only an explicit
+``VLLM_USE_V2_MODEL_RUNNER=... is set; using Model Runner V1|V2`` line passes: an
+``is unset`` default or a blacklist fallback means the yaml/env never reached the
+server, so it fails even when the effective runner happens to match; ``manifest``
 writes the run skeleton and leaves every unreadable value ``null``.
+
+``plan`` emits every serve command as ``display`` (the text read from the yaml),
+``argv`` only when ``shlex`` can rebuild that display exactly (otherwise
+``null``), plus ``requires_runner_render`` and the ``${VAR}`` ``placeholders``.
 
 Carriers, read from the runners: ``test_cases[].envs`` (``conftest.py``:
 ``env = os.environ.copy(); env.update(env_dict)``), ``deployment[].envs`` on the
@@ -41,9 +47,11 @@ Carrier rule: a pin line inside a top level ``test_cases``, ``deployment`` or
 that merges it through the ``<<: *anchor`` chain, with ``templates`` over
 ``deployment`` over ``test_cases`` when a config merges it into several.
 
-Only the standard library is imported and PyYAML never is: the tool runs on a
-CPU-only host and must not re-serialize a config, so copies keep comments, quotes
-and layout byte for byte except for the pinned value. Exit codes: 0 ok, 1
+Only the standard library plus ``regex`` (the repository lint whitelist, because
+``import re`` is forbidden by ``tools/check_forbidden_imports.py``) is imported and
+PyYAML never is: the tool runs on a CPU-only host and must not re-serialize a
+config, so copies keep comments, quotes and layout byte for byte except for the
+pinned value. Exit codes: 0 ok, 1
 verification failed, 2 unusable input or missing premise.
 """
 
@@ -52,13 +60,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 EXIT_OK, EXIT_MISMATCH, EXIT_INPUT_ERROR = 0, 1, 2
 BACKEND_ENV_VAR = "VLLM_USE_V2_MODEL_RUNNER"
@@ -87,7 +97,13 @@ PIN_PATTERN = re.compile(
 SECTION_PATTERN = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*:")
 ANCHOR_PATTERN = re.compile(r"&[ \t]*(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 ALIAS_PATTERN = re.compile(r"\*(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
-RUNNER_LOG_PATTERN = re.compile(r"using Model Runner (?P<tag>V1|V2)\b")
+EXPLICIT_PATTERN = re.compile(r"VLLM_USE_V2_MODEL_RUNNER=(?P<value>\S+) is set; using Model Runner (?P<tag>V1|V2)")
+UNSET_PATTERN = re.compile(r"VLLM_USE_V2_MODEL_RUNNER is unset; using Model Runner V2 by default")
+FALLBACK_PATTERN = re.compile(r"Model Runner V2 does not yet support .*; using the V1 model runner instead")
+PLACEHOLDER_PATTERN = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
+BRACED_SPACE_PATTERN = re.compile(r"\{[^{}]*\s[^{}]*\}")
+TRUTHY_RUNNER_VALUES = frozenset({"1", "true", "on", "yes"})
+FALSY_RUNNER_VALUES = frozenset({"0", "false", "off", "no"})
 BLOCK_INDICATORS = (">", "|")
 EXAMPLES = """examples:
   python tools/mrv_dual_run.py discover
@@ -195,18 +211,45 @@ def classify_carrier(text: str) -> str:
     return next(carrier for carrier in CARRIER_PRIORITY if carrier in carriers)
 
 
+def stray_pin_lines(text: str) -> list[int]:
+    """Lines that mention the runner variable in a form :func:`find_pins` cannot read."""
+    strays = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if BACKEND_ENV_VAR in line and PIN_PATTERN.match(line) is None and not line.lstrip().startswith("#"):
+            strays.append(number)
+    return strays
+
+
 def discover_configs(repo_root: Path) -> list[ConfigInfo]:
-    """Find the GLM configs that pin the runner and classify each carrier."""
+    """Find the GLM configs that pin the runner and classify each carrier.
+
+    A config that mentions the variable in a shape this scanner cannot read (a
+    flow mapping such as ``envs: {VLLM_USE_V2_MODEL_RUNNER: "1"}``, for example)
+    raises instead of being skipped: a silently incomplete parity matrix is worse
+    than a failing command.
+    """
     model_dir, feature_dir = repo_root / GLM_MODEL_CONFIG_DIR, repo_root / FEATURE_CONFIG_DIR
     paths = sorted(model_dir.glob("*.yaml")) if model_dir.is_dir() else []
     if feature_dir.is_dir():
         paths += [path for path in sorted(feature_dir.rglob("*.yaml")) if GLM_FAMILY_MARKER in path.name.lower()]
-    found = []
+    found: list[ConfigInfo] = []
+    problems: list[str] = []
     for path in sorted(set(paths)):
         text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(repo_root).as_posix()
         pins = find_pins(text)
         if pins:
-            found.append(ConfigInfo(path, path.relative_to(repo_root).as_posix(), classify_carrier(text), pins[0]))
+            found.append(ConfigInfo(path, rel, classify_carrier(text), pins[0]))
+            continue
+        strays = stray_pin_lines(text)
+        if strays:
+            problems.append(f"{rel} line(s) {', '.join(str(number) for number in strays)}")
+    if problems:
+        raise InputError(
+            f"{BACKEND_ENV_VAR} cannot be read in {len(problems)} config(s): {'; '.join(problems)}. "
+            "Only a block styled 'VLLM_USE_V2_MODEL_RUNNER: \"0\"' line is understood; "
+            "refusing to drop these configs from the matrix silently"
+        )
     return found
 
 
@@ -284,6 +327,37 @@ def model_of_command(command: str) -> str | None:
     return tokens[tokens.index("serve") + 1] if "serve" in tokens[:-1] else None
 
 
+def command_record(node: str, display: str, source: str, notes: list[str] | None = None) -> dict[str, Any]:
+    """Describe one serve command without pretending that it can always be split.
+
+    ``display`` keeps the text read from the yaml. ``argv`` is filled only when
+    ``shlex`` rebuilds the normalised display exactly, which fails for arguments
+    with embedded spaces such as a JSON override; ``requires_runner_render`` marks
+    commands with ``${VAR}`` placeholders or with such JSON, because the runner has
+    to render them before anything may execute the list.
+    """
+    normalized = " ".join(display.split())
+    placeholders = list(dict.fromkeys(PLACEHOLDER_PATTERN.findall(display)))
+    try:
+        argv: list[str] | None = shlex.split(normalized)
+    except ValueError:
+        argv = []
+    if not argv or shlex.join(argv) != normalized:
+        argv = None
+    return {
+        "node": node,
+        "display": display,
+        "argv": argv,
+        # A command whose argv is not trustworthy cannot be executed as-is, so it
+        # needs the runner to render it, just like the placeholder and JSON cases.
+        "requires_runner_render": bool(placeholders) or bool(BRACED_SPACE_PATTERN.search(display)) or argv is None,
+        "placeholders": placeholders,
+        "source": source,
+        "model": model_of_command(display),
+        "notes": notes or [],
+    }
+
+
 def extract_templates(lines: list[str], section: Section) -> list[dict[str, Any]]:
     """Serve commands of an external DP config: one per ``templates[]`` node."""
     model_line = find_key_line(lines, 0, section.start, "model")
@@ -298,15 +372,8 @@ def extract_templates(lines: list[str], section: Section) -> list[dict[str, Any]
         node = f"node_index={parse_scalar(node_line[2])}" if node_line is not None else f"templates[{number}]"
         if not args:
             raise CommandNotFound(f"templates[{number}] ({node}) has no server_cmd_template arguments")
-        commands.append(
-            {
-                "node": node,
-                "command": " ".join(["vllm", "serve", model, *args]),
-                "model": model,
-                "source": f"templates[{number}].server_cmd_template + top level model",
-                "notes": [],
-            }
-        )
+        display = " ".join(["vllm", "serve", model, *args])
+        commands.append(command_record(node, display, f"templates[{number}].server_cmd_template + top level model"))
     if not commands:
         raise CommandNotFound("templates section has no entries")
     return commands
@@ -331,15 +398,7 @@ def extract_deployment(lines: list[str], section: Section) -> list[dict[str, Any
             command, source = parse_scalar(rest) or "", "inline"
         if not command:
             raise CommandNotFound(f"deployment[{number}].server_cmd is empty")
-        commands.append(
-            {
-                "node": f"deployment[{number}]",
-                "command": command,
-                "model": model_of_command(command),
-                "source": f"deployment[{number}].server_cmd ({source})",
-                "notes": [],
-            }
-        )
+        commands.append(command_record(f"deployment[{number}]", command, f"deployment[{number}].server_cmd ({source})"))
     if not commands:
         raise CommandNotFound("deployment section has no entries")
     return commands
@@ -380,15 +439,7 @@ def extract_test_cases(lines: list[str], sections: list[Section], section: Secti
             notes.append(
                 "'vllm serve <model>' prefix added: the case runner composes it before the server_cmd arguments"
             )
-        commands.append(
-            {
-                "node": node,
-                "command": command,
-                "model": model_of_command(command),
-                "notes": notes,
-                "source": f"test_cases[{number}].server_cmd ({source})",
-            }
-        )
+        commands.append(command_record(node, command, f"test_cases[{number}].server_cmd ({source})", notes))
     if not commands:
         raise CommandNotFound("test_cases section has no entries")
     return commands
@@ -579,6 +630,43 @@ def run_rewrite(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def scan_runner_log(lines: list[str]) -> list[dict[str, Any]]:
+    """Classify every runner line of a server log.
+
+    ``explicit`` is the only mode that proves the env override reached the
+    server. ``unset`` means the variable was never set and V2 is the default;
+    ``fallback`` means a blacklist fell back to V1. Both mean the yaml pin did not
+    take effect, so they are failures even when the effective runner matches.
+    """
+    found: list[dict[str, Any]] = []
+    for number, line in enumerate(lines, start=1):
+        for match in EXPLICIT_PATTERN.finditer(line):
+            found.append(
+                {
+                    "line": number,
+                    "mode": "explicit",
+                    "tag": match.group("tag"),
+                    "value": match.group("value"),
+                    "text": line.strip(),
+                }
+            )
+        if UNSET_PATTERN.search(line) is not None:
+            found.append({"line": number, "mode": "unset", "tag": "V2", "value": None, "text": line.strip()})
+        if FALLBACK_PATTERN.search(line) is not None:
+            found.append({"line": number, "mode": "fallback", "tag": "V1", "value": None, "text": line.strip()})
+    return found
+
+
+def runner_value_agrees(value: str, tag: str) -> bool:
+    """Whether the env value printed on an explicit line agrees with the tag on that line."""
+    normalized = value.strip().strip("'\"").lower()
+    if normalized in TRUTHY_RUNNER_VALUES:
+        return tag == "V2"
+    if normalized in FALSY_RUNNER_VALUES:
+        return tag == "V1"
+    return True
+
+
 def run_verify_log(args: argparse.Namespace) -> int:
     """Entry point of the ``verify-log`` subcommand."""
     log_path = Path(args.log)
@@ -586,19 +674,38 @@ def run_verify_log(args: argparse.Namespace) -> int:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         return fail(f"cannot read {log_path}: {exc}")
-    matches = [
-        (number, match.group("tag"))
-        for number, line in enumerate(lines, start=1)
-        for match in RUNNER_LOG_PATTERN.finditer(line)
-    ]
-    for number, tag in matches:
-        print(f"{log_path}:{number}: {lines[number - 1].strip()}")
-    if not matches:
-        return fail(f"no 'using Model Runner V1|V2' line in {log_path}; a log without it is not a pass")
-    backends = {LOG_TAG_BACKENDS[tag] for _, tag in matches}
-    if backends != {args.expect}:
-        return fail(f"the log reports {sorted(backends)}, expected only {args.expect}", EXIT_MISMATCH)
-    print(f"runner log matches --expect {args.expect} ({len(matches)} matching line(s))")
+    found = scan_runner_log(lines)
+    for item in found:
+        print(f"{log_path}:{item['line']}: [{item['mode']}] {item['text']}")
+    if not found:
+        return fail(
+            f"no 'is set; using Model Runner V1|V2' line in {log_path}; "
+            "a log without the explicit runner line is not a pass"
+        )
+    blocked = sorted({item["mode"] for item in found if item["mode"] in {"unset", "fallback"}})
+    if blocked:
+        return fail(
+            f"{log_path} carries a {', '.join(blocked)} line: the yaml/env override was NOT applied to the server, "
+            "so the effective runner cannot prove anything here",
+            EXIT_MISMATCH,
+        )
+    explicit = [item for item in found if item["mode"] == "explicit"]
+    expected = LOG_TAGS[args.expect]
+    tags = {item["tag"] for item in explicit}
+    if len(tags) > 1:
+        return fail(
+            f"the log carries contradictory explicit runner lines {sorted(tags)}; cannot prove {args.expect}",
+            EXIT_MISMATCH,
+        )
+    if tags != {expected}:
+        return fail(f"the log explicitly reports {sorted(tags)}, expected {expected}", EXIT_MISMATCH)
+    inconsistent = [item["line"] for item in explicit if not runner_value_agrees(item["value"], expected)]
+    if inconsistent:
+        return fail(
+            f"explicit line(s) {inconsistent} print a value that contradicts Model Runner {expected}",
+            EXIT_MISMATCH,
+        )
+    print(f"runner log matches --expect {args.expect} ({len(explicit)} explicit line(s))")
     return EXIT_OK
 
 
