@@ -30,6 +30,7 @@ EXPECTED_PINS = {
     f"{GLM_DIR}/GLM-5.2-W8A8C8-layerwise-PD.yaml": (59, "0"),
     f"{GLM_DIR}/GLM-5.3-Flash-W8A8-130k-PD.yaml": (41, "1"),
     f"{GLM_DIR}/GLM5_1_W4A4_A5.yaml": (9, "1"),
+    f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml": (39, "1"),
 }
 EXPECTED_CARRIERS = {
     "test_cases": {
@@ -45,6 +46,7 @@ EXPECTED_CARRIERS = {
         f"{GLM_DIR}/GLM-5.1-W8A8C8-A3_198k_function.yaml",
         f"{GLM_DIR}/GLM-5.2-W8A8C8-A3_128k-static-super-kernels.yaml",
         f"{GLM_DIR}/GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml",
+        f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml",
     },
     "external_templates": {
         f"{GLM_DIR}/GLM-5.1-W8A8C8-128k-1k-90-50-PD.yaml",
@@ -154,9 +156,9 @@ def cli_json(capsys, argv: list[str]) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
-def test_discover_finds_exactly_fourteen_configs():
+def test_discover_finds_all_pinned_glm_configs():
     configs = dual.discover_configs(REPO_ROOT)
-    assert len(configs) == 14
+    assert len(configs) == 15
 
 
 def test_discover_paths_match_the_audited_matrix():
@@ -168,10 +170,10 @@ def test_discover_reports_line_and_value_for_every_pin():
     assert {info.rel: (info.pin.line, info.pin.value) for info in dual.discover_configs(REPO_ROOT)} == EXPECTED_PINS
 
 
-def test_discover_carrier_counts_are_six_four_four(capsys):
+def test_discover_carrier_counts_match_the_matrix(capsys):
     payload = cli_json(capsys, ["discover", "--repo-root", str(REPO_ROOT)])
-    assert payload["total"] == 14
-    assert payload["counts"] == {"test_cases": 6, "deployment": 4, "external_templates": 4}
+    assert payload["total"] == 15
+    assert payload["counts"] == {"test_cases": 6, "deployment": 5, "external_templates": 4}
 
 
 def test_discover_assigns_every_config_to_the_expected_carrier():
@@ -184,6 +186,13 @@ def test_discover_assigns_every_config_to_the_expected_carrier():
 def test_discover_classifies_the_single_quoted_layerwise_config():
     info = next(item for item in dual.discover_configs(REPO_ROOT) if item.rel.endswith("layerwise-PD.yaml"))
     assert (info.carrier, info.pin.value, info.pin.line) == ("external_templates", "0", 59)
+
+
+def test_discover_includes_the_a2_single_node_config():
+    info = next(
+        item for item in dual.discover_configs(REPO_ROOT) if item.rel.endswith("GLM5_1-W8A8-A2-single-node.yaml")
+    )
+    assert (info.carrier, info.pin.value) == ("deployment", "1")
 
 
 def test_discover_ignores_a_commented_pin(tmp_path):
@@ -277,7 +286,7 @@ def test_rewrite_cli_refuses_to_overwrite_the_source(tmp_path):
 def test_plan_print_only_covers_all_configs_with_two_command_sets(capsys):
     dest = REPO_ROOT / "tests/e2e/cases/.should-not-exist"
     payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(dest)])
-    assert len(payload["configs"]) == 14
+    assert len(payload["configs"]) == 15
     assert not dest.exists()
     for entry in payload["configs"]:
         assert set(entry["targets"]) == {"mrv1", "mrv2"}
@@ -291,10 +300,10 @@ def test_plan_print_only_covers_all_configs_with_two_command_sets(capsys):
 def test_plan_marks_no_change_needed_per_target(capsys):
     payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
     actions = {target: [entry["targets"][target]["action"] for entry in payload["configs"]] for target in dual.BACKENDS}
-    assert actions["mrv1"].count("rewrite") == 12
+    assert actions["mrv1"].count("rewrite") == 13
     assert actions["mrv1"].count("no-change-needed") == 2
     assert actions["mrv2"].count("rewrite") == 2
-    assert actions["mrv2"].count("no-change-needed") == 12
+    assert actions["mrv2"].count("no-change-needed") == 13
     unchanged = {
         entry["path"] for entry in payload["configs"] if entry["targets"]["mrv2"]["action"] == "no-change-needed"
     }
@@ -308,7 +317,7 @@ def test_plan_writes_two_trees_and_never_touches_the_repo(tmp_path):
     dest = tmp_path / "dual"
     assert dual.main(["plan", "--dest", str(dest)]) == dual.EXIT_OK
     copies = sorted(dest.rglob("*.yaml"))
-    assert len(copies) == 28
+    assert len(copies) == 30
     for rel, (pin_line, source_value) in EXPECTED_PINS.items():
         source_lines = before[rel].splitlines(keepends=True)
         for target, expected in dual.BACKEND_VALUES.items():
