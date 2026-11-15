@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tools import mrv_dual_run as dual
 
@@ -30,7 +31,7 @@ EXPECTED_PINS = {
     f"{GLM_DIR}/GLM-5.2-W8A8C8-layerwise-PD.yaml": (59, "0"),
     f"{GLM_DIR}/GLM-5.3-Flash-W8A8-130k-PD.yaml": (41, "1"),
     f"{GLM_DIR}/GLM5_1_W4A4_A5.yaml": (9, "1"),
-    f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml": (39, "1"),
+    f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml": (49, "1"),
 }
 EXPECTED_CARRIERS = {
     "test_cases": {
@@ -40,13 +41,13 @@ EXPECTED_CARRIERS = {
         f"{GLM_DIR}/GLM-5.2-W4A8-MTP-A3-V2.yaml",
         f"{GLM_DIR}/GLM-5.2-W4A8C8-SFA-DCP.yaml",
         f"{GLM_DIR}/GLM5_1_W4A4_A5.yaml",
+        f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml",
     },
     "deployment": {
         f"{GLM_DIR}/GLM-5.1-W8A8C8-A3_128k_90_50.yaml",
         f"{GLM_DIR}/GLM-5.1-W8A8C8-A3_198k_function.yaml",
         f"{GLM_DIR}/GLM-5.2-W8A8C8-A3_128k-static-super-kernels.yaml",
         f"{GLM_DIR}/GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml",
-        f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml",
     },
     "external_templates": {
         f"{GLM_DIR}/GLM-5.1-W8A8C8-128k-1k-90-50-PD.yaml",
@@ -173,7 +174,7 @@ def test_discover_reports_line_and_value_for_every_pin():
 def test_discover_carrier_counts_match_the_matrix(capsys):
     payload = cli_json(capsys, ["discover", "--repo-root", str(REPO_ROOT)])
     assert payload["total"] == 15
-    assert payload["counts"] == {"test_cases": 6, "deployment": 5, "external_templates": 4}
+    assert payload["counts"] == {"test_cases": 7, "deployment": 4, "external_templates": 4}
 
 
 def test_discover_assigns_every_config_to_the_expected_carrier():
@@ -192,7 +193,7 @@ def test_discover_includes_the_a2_single_node_config():
     info = next(
         item for item in dual.discover_configs(REPO_ROOT) if item.rel.endswith("GLM5_1-W8A8-A2-single-node.yaml")
     )
-    assert (info.carrier, info.pin.value) == ("deployment", "1")
+    assert (info.carrier, info.pin.value) == ("test_cases", "1")
 
 
 def test_discover_ignores_a_commented_pin(tmp_path):
@@ -557,13 +558,40 @@ def test_command_record_refuses_argv_and_lists_placeholders():
     assert record["requires_runner_render"] is True
 
 
-def test_plan_marks_the_json_config_as_requiring_runner_render(capsys):
+def test_plan_keeps_test_cases_json_arguments_as_single_tokens(capsys):
     payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
     entry = next(item for item in payload["configs"] if item["path"].endswith("SFA-DCP.yaml"))
     command = entry["targets"]["mrv1"]["commands"][0]
+    tokens = shlex.split(command["display"])
+    case = yaml.safe_load((REPO_ROOT / entry["path"]).read_text(encoding="utf-8"))["test_cases"][0]
+    assert tokens == ["vllm", "serve", case["model"], *case["server_cmd"]]
+    assert len(tokens) == 45
+    assert command["argv"] == tokens
     assert command["requires_runner_render"] is True
-    assert command["argv"] is None
-    assert "{" in command["display"] and '"' in command["display"]
+
+
+def test_a2_single_node_display_has_thirty_shell_tokens(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    entry = next(item for item in payload["configs"] if item["path"].endswith("GLM5_1-W8A8-A2-single-node.yaml"))
+    command = entry["targets"]["mrv1"]["commands"][0]
+    tokens = shlex.split(command["display"])
+    case = yaml.safe_load((REPO_ROOT / entry["path"]).read_text(encoding="utf-8"))["test_cases"][0]
+    assert tokens == ["vllm", "serve", case["model"], *case["server_cmd"]]
+    assert len(tokens) == 30
+    assert command["argv"] == tokens
+    assert tokens.count("--tensor-parallel-size") == 1
+    assert any(token.startswith('{"cudagraph_mode"') and " " in token for token in tokens)
+
+
+def test_deployment_and_external_display_behavior_is_unchanged(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    for name in ("GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml", "GLM-5.1-W8A8C8-128k-1k-90-50-PD.yaml"):
+        command = next(item for item in payload["configs"] if item["path"].endswith(name))["targets"]["mrv1"][
+            "commands"
+        ][0]
+        assert command["argv"] is None
+        assert command["requires_runner_render"] is True
+        assert command["display"].startswith("vllm serve")
 
 
 def test_plan_exposes_placeholders_for_the_four_external_configs(capsys):

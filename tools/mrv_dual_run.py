@@ -423,19 +423,21 @@ def extract_test_cases(lines: list[str], sections: list[Section], section: Secti
             if alias is None:
                 raise CommandNotFound(f"test_cases[{number}].server_cmd has an unreadable alias {raw!r}")
             command, source = (
-                " ".join(anchor_list_args(lines, sections, alias.group("name"))),
+                shlex.join(anchor_list_args(lines, sections, alias.group("name"))),
                 f"*{alias.group('name')}",
             )
         elif raw:
             command, source = parse_scalar(raw) or "", "inline"
         else:
-            command, source = " ".join(block_list_items(lines, key_index, key_indent)), "block list"
+            # Keep the arguments shell-safe: a JSON argument with spaces must
+            # stay one token when the executor passes the display to sh -c.
+            command, source = shlex.join(block_list_items(lines, key_index, key_indent)), "block list"
         if not command:
             raise CommandNotFound(f"test_cases[{number}].server_cmd is empty")
         if model_of_command(command) is None:
             if not model:
                 raise CommandNotFound(f"test_cases[{number}].server_cmd lists only flags and the case has no model")
-            command = " ".join(["vllm", "serve", model, command])
+            command = shlex.join(["vllm", "serve", model, *shlex.split(command)])
             notes.append(
                 "'vllm serve <model>' prefix added: the case runner composes it before the server_cmd arguments"
             )

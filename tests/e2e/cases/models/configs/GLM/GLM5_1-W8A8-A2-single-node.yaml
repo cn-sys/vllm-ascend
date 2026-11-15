@@ -1,24 +1,24 @@
 # ============================================================
-# GLM-5.1-W8A8 on a single Atlas A2 node (8 NPUs) — T4 parity baseline
+# GLM-5.1-W8A8 on a single Atlas A2 node (8 NPUs) - T4 parity baseline
 #
-# Derived from tests/e2e/cases/models/configs/GLM/GLM5_1-W8A8-A2-dual-nodes.yaml
-# by removing the data-parallel arguments of the first deployment: the parent
-# starts one DP2 x TP8 group (2 nodes x 8 cards), this file starts the same
-# TP8 x EP group on one node.
+# Derived from tests/e2e/cases/models/configs/GLM/GLM5_1-W8A8-A2-dual-nodes.yaml:
+# the parent starts one DP2 x TP8 group across 2 nodes (8 cards each), this case
+# starts the same TP8 x EP group on one node. The server_cmd below carries only
+# the arguments (the single-node runner prepends "vllm serve <model>").
 #
-# Model:            Eco-Tech/GLM-5.1-w8a8
-# Model revision:   TODO (not recorded upstream; fill in before publishing results)
-# Hardware:         Atlas A2 x 8 NPUs, single node (num_nodes: 1, npu_per_node: 8)
-# Parallel:         TP=8, DP=1 (no data-parallel arguments), EP enabled
-# Graph mode:       FULL_DECODE_ONLY, cudagraph_capture_sizes [1,4,8,12,16,20,24,28,32,36,48,60,72]
-# Speculative:      deepseek_mtp, num_speculative_tokens=3
-# CANN version:     TODO (unknown for the target HiDevLab image)
+# Model:             Eco-Tech/GLM-5.1-w8a8
+# Model revision:    TODO (not recorded upstream; fill in before publishing results)
+# Hardware:          Atlas A2 x 8 NPUs, single node (TP=8, DP=1, EP enabled)
+# Graph mode:        FULL_DECODE_ONLY, cudagraph_capture_sizes [1,4,8,12,16,20,24,28,32,36,48,60,72]
+# Speculative:       deepseek_mtp, num_speculative_tokens=3
+# max_model_len:     38000
+# CANN version:      TODO (unknown for the target HiDevLab image)
 # torch_npu version: TODO (unknown for the target HiDevLab image)
 # vLLM / vllm-ascend tag: TODO (align with .github/vllm-release-tag.commit at run time)
-# Model runner:     env_common pins VLLM_USE_V2_MODEL_RUNNER: "1"; flip it to "0"
-#                   in a copy for the MRV1 leg of the comparison.
+# Model runner:      env_common pins VLLM_USE_V2_MODEL_RUNNER: "1"; the MRV1/MRV2
+#                    dual-run planner flips it to "0" in the copied yaml.
 #
-# Full serve command (identical to deployment[0].server_cmd below):
+# Full serve command (arguments below + runner prefix):
 #   vllm serve Eco-Tech/GLM-5.1-w8a8
 #     --host 0.0.0.0 --port $SERVER_PORT
 #     --tensor-parallel-size 8 --enable-expert-parallel --seed 1024
@@ -28,13 +28,23 @@
 #     --additional-config '{"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"fuse_qknorm_rope":false},"scheduler_config":{"enable_balance_scheduling":false},"enable_mlapo":true}'
 #     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,48,60,72]}'
 #     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+#
+# SERVER_PORT is DEFAULT_PORT on purpose: SingleNodeConfig.__post_init__
+# (tests/e2e/common/single_node/single_node_config.py:53-56) replaces
+# DEFAULT_PORT/None with get_open_port(), so a shared CI host cannot collide on a
+# fixed port. The MRV1/MRV2 executor overrides it with its own allocated port.
+#
+# TODO(register after N3b-2): this case has never run on a real A2x8 host, so it
+# is intentionally absent from every workflow matrix. After N3b-2 passes, add it
+# to .github/workflows/configs/nightly_config.yaml under a2.single_node.test_config:
+#   a2:
+#     single_node:
+#       test_config:
+#         - name: GLM-5.1-w8a8-A2-single-node
+#           os: linux-aarch64-a2b3-8
+#           config_file_path: GLM5_1-W8A8-A2-single-node.yaml
+#           config_base_path: tests/e2e/cases/models/configs/GLM
 # ============================================================
-test_name: "GLM-5.1-w8a8-A2-single-node"
-model: "Eco-Tech/GLM-5.1-w8a8"
-num_nodes: 1
-npu_per_node: 8
-dp_load_balancing: internal
-
 env_common: &env_common
   VLLM_USE_V2_MODEL_RUNNER: "1"
   HCCL_OP_EXPANSION_MODE: "AIV"
@@ -45,54 +55,65 @@ env_common: &env_common
   VLLM_USE_MODELSCOPE: true
   VLLM_ENGINE_READY_TIMEOUT_S: 3000
   VLLM_RPC_TIMEOUT: 600
-  SERVER_PORT: 8078
+  SERVER_PORT: DEFAULT_PORT
 
-deployment:
-  -
+test_cases:
+  - name: "GLM-5.1-w8a8-A2-single-node"
+    model: "Eco-Tech/GLM-5.1-w8a8"
     envs:
       <<: *env_common
-    server_cmd: >
-      vllm serve Eco-Tech/GLM-5.1-w8a8
-      --host 0.0.0.0
-      --port $SERVER_PORT
-      --tensor-parallel-size 8
-      --enable-expert-parallel
-      --seed 1024
-      --max-num-seqs 64
-      --max-model-len 38000
-      --max-num-batched-tokens 4096
-      --trust-remote-code
-      --gpu-memory-utilization 0.95
-      --quantization ascend
-      --no-enable-prefix-caching
-      --additional-config '{"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"fuse_qknorm_rope":false},"scheduler_config":{"enable_balance_scheduling":false},"enable_mlapo":true}'
-      --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,48,60,72]}'
-      --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
-benchmarks:
-  perf-warm:
-    case_type: performance
-    dataset_path: vllm-ascend/GSM8K-in3500-bs2800
-    request_conf: vllm_api_stream_chat
-    dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
-    num_prompts: 18
-    max_out_len: 1500
-    batch_size: 18
-    request_rate: 0
-    # No historical single-node baseline exists. null makes task_passed() skip
-    # the comparison (tests/e2e/common/multi_node/benchmark_results.py:47-54)
-    # while the measured number is still recorded. TODO: fill in after the
-    # first A2x8 MTP run, do not invent a number.
-    baseline: null
-    threshold: 0.97
-  perf:
-    case_type: performance
-    dataset_path: vllm-ascend/GSM8K-in3500-bs2800
-    request_conf: vllm_api_stream_chat
-    dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
-    num_prompts: 72
-    max_out_len: 1500
-    batch_size: 18
-    request_rate: 0
-    # Same reasoning as perf-warm: baseline is unknown for the single-node shape.
-    baseline: null
-    threshold: 0.97
+    server_cmd:
+      - --host
+      - 0.0.0.0
+      - --port
+      - $SERVER_PORT
+      - --tensor-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --seed
+      - "1024"
+      - --max-num-seqs
+      - "64"
+      - --max-model-len
+      - "38000"
+      - --max-num-batched-tokens
+      - "4096"
+      - --trust-remote-code
+      - --gpu-memory-utilization
+      - "0.95"
+      - --quantization
+      - ascend
+      - --no-enable-prefix-caching
+      - --additional-config
+      - '{"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"fuse_qknorm_rope":false},"scheduler_config":{"enable_balance_scheduling":false},"enable_mlapo":true}'
+      - --compilation-config
+      - '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,48,60,72]}'
+      - --speculative-config
+      - '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+    benchmarks:
+      perf-warm:
+        case_type: performance
+        dataset_path: vllm-ascend/GSM8K-in3500-bs2800
+        request_conf: vllm_api_stream_chat
+        dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
+        num_prompts: 18
+        max_out_len: 1500
+        batch_size: 18
+        request_rate: 0
+        # No historical single-node baseline exists; null makes the single-node
+        # and multi-node task_passed() skip the comparison while the measured
+        # number is still recorded. TODO: fill in after the first A2x8 MTP run.
+        baseline: null
+        threshold: 0.97
+      perf:
+        case_type: performance
+        dataset_path: vllm-ascend/GSM8K-in3500-bs2800
+        request_conf: vllm_api_stream_chat
+        dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
+        num_prompts: 72
+        max_out_len: 1500
+        batch_size: 18
+        request_rate: 0
+        # Same reasoning as perf-warm: baseline is unknown for the single-node shape.
+        baseline: null
+        threshold: 0.97
