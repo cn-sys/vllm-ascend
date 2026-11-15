@@ -92,6 +92,16 @@ MANIFEST_FIELDS = (
     "commands", "generated_at",
 )  # fmt: skip
 PLACEHOLDER_PATTERN = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
+SHELL_VAR_PATTERN = re.compile(r"\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
+PD_MARKERS = (
+    "kv-transfer-config",
+    "kv_transfer_config",
+    "prefill-decode",
+    "prefill_decode",
+    "env_prefill",
+    "env_decode",
+)
+SERVER_LOG_SHA256_NOTE = "null by design: one run has two server logs, so read backends.<backend>.log_sha256 instead"
 SECTION_PATTERN = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*:")
 TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
@@ -179,6 +189,7 @@ class Options:
     stop_grace: float
     variables: dict[str, str]
     dry_run: bool
+    allow_single_command: bool
 
 
 @dataclass
@@ -193,6 +204,13 @@ class ConfigPlan:
     commands: dict[str, str]
     copies: dict[str, Path]
     env: dict[str, str] = field(default_factory=dict)
+    command_count: int = 1
+    command_counts: dict[str, int] = field(default_factory=dict)
+    carrier: str | None = None
+    num_nodes: int | None = None
+    is_pd: bool = False
+    single_command_override: bool = False
+    blocked_reason: str | None = None
 
 
 @dataclass
@@ -213,6 +231,8 @@ class BackendRun:
     env_overrides: dict[str, str] = field(default_factory=dict)
     collect_argv: list[str] = field(default_factory=list)
     ignored_commands: int = 0
+    missing_placeholders: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_variables: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Executor:
@@ -368,6 +388,71 @@ def render_placeholders(template: str, variables: dict[str, str]) -> tuple[str, 
     return PLACEHOLDER_PATTERN.sub(lambda match: variables[match.group("name")], template), []
 
 
+def substitute_placeholders(template: str, variables: dict[str, str]) -> str:
+    """Fill every placeholder it can and leave the unknown ones visible for the scan."""
+    return PLACEHOLDER_PATTERN.sub(lambda match: variables.get(match.group("name"), match.group(0)), template)
+
+
+def top_scalar(text: str, key: str) -> str | None:
+    """Value of one top level yaml scalar."""
+    match = re.search(rf"(?m)^{re.escape(key)}:[ \t]*(?P<rest>[^\n#]*)", text)
+    return scan_scalar(match.group("rest")) if match is not None else None
+
+
+def config_num_nodes(text: str) -> int | None:
+    """The num_nodes header of a config, None when the config is single node."""
+    raw = top_scalar(text, "num_nodes")
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def is_pd_config(rel: str, text: str) -> bool:
+    """Whether a config describes a prefill/decode disaggregated deployment."""
+    if "-PD" in Path(rel).stem.upper() or "-PD." in rel.upper():
+        return True
+    lowered = text.lower()
+    return any(marker in lowered for marker in PD_MARKERS)
+
+
+def single_command_problem(
+    rel: str, count: int, carrier: str | None, num_nodes: int | None, pd: bool, allow: bool
+) -> str | None:
+    """Refuse to run only the first of several node commands, and say why."""
+    if count <= 1:
+        return None
+    if not allow:
+        return (
+            f"{rel}: {count} serve commands (one per node); running only the first would drop {count - 1} of them. "
+            "Pass --allow-single-command only for an otherwise single-node config"
+        )
+    if carrier == "external_templates":
+        return (
+            f"{rel}: external_templates configs need every node command; this executor cannot run them, "
+            "not even with --allow-single-command"
+        )
+    if num_nodes is not None and num_nodes > 1:
+        return f"{rel}: num_nodes={num_nodes}; multi-node launch is out of scope, not even with --allow-single-command"
+    if pd:
+        return (
+            f"{rel}: PD (prefill/decode disaggregated) configs are out of scope, not even with --allow-single-command"
+        )
+    return None
+
+
+def format_variable_problems(plan: ConfigPlan, backend: str, problems: list[dict[str, Any]]) -> str:
+    """One message that names every missing placeholder and unresolved shell variable."""
+    placeholders = sorted({item["variable"] for item in problems if item["kind"] == "placeholder"})
+    variables = [item for item in problems if item["kind"] == "variable"]
+    parts: list[str] = []
+    if placeholders:
+        parts.append(f"unresolved placeholder(s) {placeholders}; pass --var NAME=VALUE")
+    if variables:
+        parts.append(f"unresolved variable(s) {json.dumps(variables)}; pass --var NAME=VALUE or export them")
+    return f"{plan.config_yaml or plan.slug} ({backend}): " + "; ".join(parts)
+
+
 def base_variables(port: int, backend: str) -> dict[str, str]:
     """Variables every serve command, health URL and base URL may use."""
     value = BACKEND_VALUES[backend]
@@ -466,14 +551,9 @@ def record_command(
     )
 
 
-def render_environment(plan: ConfigPlan, variables: dict[str, str], port: int, backend: str) -> dict[str, str]:
+def render_environment(plan: ConfigPlan, port: int, backend: str, report: Any) -> dict[str, str]:
     """Render the yaml env values and layer the allocated port and runner value on top."""
-    overrides: dict[str, str] = {}
-    for name, value in plan.env.items():
-        rendered, missing = render_placeholders(value, variables)
-        if missing:
-            raise InputError(f"unresolved placeholder(s) {missing} in env {name}; pass --var NAME=VALUE")
-        overrides[name] = rendered
+    overrides = {name: report(f"env:{name}", value) for name, value in plan.env.items()}
     overrides[RUNNER_ENV] = BACKEND_VALUES[backend]
     overrides["SERVER_PORT"] = str(port)
     return overrides
@@ -503,33 +583,59 @@ def execute_backend(
 ) -> None:
     """Launch, gate, collect and stop one backend; mutate ``run`` with what happened."""
     run.port = port_for(options.port_base, plan.index, run.backend)
+    if plan.single_command_override:
+        run.ignored_commands = max(0, plan.command_counts.get(run.backend, plan.command_count) - 1)
     variables = dict(options.variables)
     variables.update(base_variables(run.port, run.backend))
     variables["CONFIG"] = str(plan.copies[run.backend])
-    template = plan.commands[run.backend]
-    rendered, missing = render_placeholders(template, variables)
-    run.rendered = rendered
-    if missing:
-        raise InputError(
-            f"unresolved placeholder(s) {missing} in the {run.backend} serve command; pass --var NAME=VALUE"
+    env_keys = set(plan.env) | set(variables) | set(os.environ) | {RUNNER_ENV, "SERVER_PORT"}
+    problems: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def report(location: str, template: str) -> str:
+        """Substitute what can be resolved and record everything the child cannot resolve."""
+        missing = sorted({match.group("name") for match in PLACEHOLDER_PATTERN.finditer(template)} - set(variables))
+        for name in missing:
+            record(name, location, "placeholder")
+        rendered = substitute_placeholders(template, variables)
+        for match in SHELL_VAR_PATTERN.finditer(rendered):
+            if match.group("name") not in env_keys:
+                record(match.group("name"), location, "variable")
+        return rendered
+
+    def record(name: str, location: str, kind: str) -> None:
+        key = (name, location, kind)
+        if key in seen:
+            return
+        seen.add(key)
+        problems.append(
+            {
+                "config": plan.config_yaml or plan.slug,
+                "backend": run.backend,
+                "variable": name,
+                "location": location,
+                "kind": kind,
+            }
         )
-    health_url, missing = render_placeholders(options.health_url, variables)
-    if missing:
-        raise InputError(f"unresolved placeholder(s) {missing} in --health-url; pass --var NAME=VALUE")
-    base_url, missing = render_placeholders(options.base_url, variables)
-    if missing:
-        raise InputError(f"unresolved placeholder(s) {missing} in --base-url; pass --var NAME=VALUE")
-    overrides = render_environment(plan, variables, run.port, run.backend)
+
+    rendered = report("command", plan.commands[run.backend])
+    run.rendered = rendered
+    health_url = report("health", options.health_url)
+    base_url = report("base", options.base_url)
+    overrides = render_environment(plan, run.port, run.backend, report)
     run.env_overrides = overrides
     run.log_path = plan.data_dir / run.backend / "server.log"
     run.collect_path = plan.data_dir / run.backend / "collect.jsonl"
-    collect_argv = collect_command(plan, options, run, base_url)
-    run.collect_argv = collect_argv
+    run.collect_argv = collect_command(plan, options, run, base_url)
+    run.missing_placeholders = [item for item in problems if item["kind"] == "placeholder"]
+    run.unresolved_variables = [item for item in problems if item["kind"] == "variable"]
+    if problems and not options.dry_run:
+        raise InputError(format_variable_problems(plan, run.backend, problems))
     if options.dry_run:
         return
     if port_is_open(run.port):
         raise Aborted(f"port {run.port} is already in use before the {run.backend} server starts")
-    env = {**os.environ, **overrides}
+    env = {**os.environ, **overrides, **options.variables}
     launch: Launch | None = None
     log_path = run.log_path
     try:
@@ -542,8 +648,8 @@ def execute_backend(
         if gate.returncode != 0:
             detail = (gate.stderr or gate.stdout).strip() or tail_of(log_path)
             raise Aborted(f"{run.backend} log gate failed with {gate.returncode}: {detail}")
-        collected = executor.run(collect_argv, REPO_ROOT, env, options.collect_timeout)
-        record_command(records, "collect", run.backend, collect_argv, REPO_ROOT, overrides, collected)
+        collected = executor.run(run.collect_argv, REPO_ROOT, env, options.collect_timeout)
+        record_command(records, "collect", run.backend, run.collect_argv, REPO_ROOT, overrides, collected)
         run.collect_exit = collected.returncode
         if collected.returncode != 0:
             raise Aborted(f"{run.backend} collect failed with {collected.returncode}: {collected.stderr.strip()}")
@@ -592,6 +698,9 @@ def build_manifest(
         }
         for backend, run in runs.items()
     }
+    manifest["command_count"] = plan.command_count
+    manifest["single_command_override"] = plan.single_command_override
+    manifest["server_log_sha256_note"] = SERVER_LOG_SHA256_NOTE
     manifest["config_slug"] = plan.slug
     manifest["data_dir"] = str(plan.data_dir)
     manifest["dest"] = str(options.dest)
@@ -628,12 +737,17 @@ def archive_dry_run(
     plan: ConfigPlan, runs: dict[str, BackendRun], options: Options, records: list[dict[str, Any]]
 ) -> None:
     """Print the sequence ``run`` would execute; never launch, never write."""
+    unresolved = [item for run in runs.values() for item in run.missing_placeholders + run.unresolved_variables]
     payload = {
         "dry_run": True,
         "config": plan.slug,
         "config_yaml": plan.config_yaml,
         "data_dir": str(plan.data_dir),
         "dest": str(options.dest),
+        "command_count": plan.command_count,
+        "single_command_override": plan.single_command_override,
+        "ignored_commands": {run.backend: run.ignored_commands for run in runs.values()},
+        "unresolved_variables": unresolved,
         "plan_argv": [record["argv"] for record in records if record["stage"] == "plan"],
         "backends": [
             {
@@ -653,6 +767,8 @@ def archive_dry_run(
                 "collect_argv": run.collect_argv,
                 "server_log": str(run.log_path),
                 "collect": str(run.collect_path),
+                "ignored_commands": run.ignored_commands,
+                "unresolved_variables": run.missing_placeholders + run.unresolved_variables,
             }
             for run in runs.values()
         ],
@@ -675,6 +791,11 @@ def execute_config(
             execute_backend(plan, run, options, executor, records)
         if options.dry_run:
             archive_dry_run(plan, runs, options, records)
+            unresolved = [item for run in runs.values() for item in run.missing_placeholders + run.unresolved_variables]
+            if unresolved:
+                return fail(
+                    f"{plan.slug}: dry-run found {len(unresolved)} unresolved value(s): {json.dumps(unresolved)}"
+                )
             return EXIT_OK
         compare = run_compare(plan, options, executor, records)
     except (Aborted, InputError) as exc:
@@ -724,8 +845,14 @@ def matches_slug(path: str, slug: str) -> bool:
 
 def load_plans(
     slugs: list[str], data_dir: Path, options: Options, executor: Executor, records: list[dict[str, Any]]
-) -> list[ConfigPlan]:
-    """Materialise the copies once and turn the plan JSON into the execution inputs."""
+) -> tuple[list[ConfigPlan], list[str]]:
+    """Materialise the copies once and turn the plan JSON into the execution inputs.
+
+    A config with several node commands is not silently reduced to its first
+    command: that is recorded as a problem and ``run_real`` refuses to start
+    anything unless ``--allow-single-command`` explicitly allows a single-node
+    config to run only its first command.
+    """
     argv = plan_argv(options, slugs)
     result = executor.run(argv, REPO_ROOT, None, 300)
     record_command(records, "plan", None, argv, REPO_ROOT, {}, result)
@@ -733,7 +860,8 @@ def load_plans(
         raise InputError(f"mrv_dual_run.py plan failed with {result.returncode}: {result.stderr.strip()}")
     payload = json.loads(result.stdout)
     total = len(slugs)
-    plans = []
+    plans: list[ConfigPlan] = []
+    problems: list[str] = []
     for index, slug in enumerate(slugs):
         entry = next((item for item in payload["configs"] if matches_slug(item["path"], slug)), None)
         if entry is None:
@@ -741,15 +869,35 @@ def load_plans(
         commands: dict[str, str] = {}
         copies: dict[str, Path] = {}
         models: set[str] = set()
+        command_counts: dict[str, int] = {}
         for backend in BACKENDS:
             candidates = entry["targets"][backend]["commands"]
+            command_counts[backend] = len(candidates)
             commands[backend] = candidates[0]["display"]
             models.add(candidates[0]["model"])
             dest = entry["targets"][backend]["dest"]
             copies[backend] = Path(dest) if dest else REPO_ROOT / entry["path"]
         if None in models or len(models) != 1:
             raise InputError(f"{entry['path']}: cannot determine the served model name for collect")
-        env = config_env(copies["mrv1"].read_text(encoding="utf-8"))
+        try:
+            config_text = (REPO_ROOT / entry["path"]).read_text(encoding="utf-8")
+        except OSError:
+            config_text = copies["mrv1"].read_text(encoding="utf-8")
+        command_count = max(command_counts.values())
+        num_nodes = config_num_nodes(config_text)
+        pd_config = is_pd_config(entry["path"], config_text)
+        problem = single_command_problem(
+            entry["path"], command_count, entry.get("carrier"), num_nodes, pd_config, options.allow_single_command
+        )
+        override = bool(options.allow_single_command and command_count > 1 and problem is None)
+        if override:
+            print(
+                f"warning: {entry['path']}: only the first of {command_count} serve commands will run "
+                f"(--allow-single-command); {command_count - 1} node command(s) ignored",
+                file=sys.stderr,
+            )
+        if problem is not None:
+            problems.append(problem)
         plan_data_dir = data_dir if total == 1 else data_dir / slug
         plans.append(
             ConfigPlan(
@@ -760,10 +908,17 @@ def load_plans(
                 model=models.pop(),
                 commands=commands,
                 copies=copies,
-                env=env,
+                env=config_env(copies["mrv1"].read_text(encoding="utf-8")),
+                command_count=command_count,
+                command_counts=command_counts,
+                carrier=entry.get("carrier"),
+                num_nodes=num_nodes,
+                is_pd=pd_config,
+                single_command_override=override,
+                blocked_reason=problem,
             )
         )
-    return plans
+    return plans, problems
 
 
 def stub_command() -> str:
@@ -788,6 +943,7 @@ def rehearse_options(args: argparse.Namespace) -> Options:
         stop_grace=DEFAULT_STOP_GRACE,
         variables=variables,
         dry_run=False,
+        allow_single_command=False,
     )
 
 
@@ -830,14 +986,26 @@ def run_real(args: argparse.Namespace) -> int:
             stop_grace=DEFAULT_STOP_GRACE,
             variables=parse_variables(args.var),
             dry_run=bool(args.dry_run),
+            allow_single_command=bool(args.allow_single_command),
         )
         records: list[dict[str, Any]] = []
-        plans = load_plans(slugs, Path(args.data_dir), options, Executor(), records)
+        plans, problems = load_plans(slugs, Path(args.data_dir), options, Executor(), records)
     except (InputError, OSError, json.JSONDecodeError) as exc:
         return fail(str(exc))
-    if not options.dry_run:
+    if options.dry_run:
+        exit_code = EXIT_INPUT_ERROR if problems else EXIT_OK
         for plan in plans:
-            plan.data_dir.mkdir(parents=True, exist_ok=True)
+            if execute_config(plan, options, Executor(), records) == EXIT_INPUT_ERROR:
+                exit_code = EXIT_INPUT_ERROR
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return exit_code
+    if problems:
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return fail(f"{len(problems)} config(s) cannot be run by this executor; nothing was launched")
+    for plan in plans:
+        plan.data_dir.mkdir(parents=True, exist_ok=True)
     exit_code = EXIT_OK
     for plan in plans:
         code = execute_config(plan, options, Executor(), records)
@@ -961,6 +1129,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--data-dir", required=True, help="directory that receives the run products")
     run.add_argument("--dest", required=True, help="directory that receives the rewritten config copies")
     run.add_argument("--dry-run", action="store_true", help="print the sequence; launch nothing")
+    run.add_argument(
+        "--allow-single-command",
+        action="store_true",
+        help="allow a single-node config with several node commands to run only the first one",
+    )
     add_common_options(run)
     run.set_defaults(handler=run_real)
     stub = subparsers.add_parser("_stub-server", help="deterministic stub server used by rehearse")

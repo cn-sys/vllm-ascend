@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,7 @@ class FakeExecutor(parity.Executor):
         self.log_text = log_text
         self.calls: list[str] = []
         self.launches: list[tuple[str, int]] = []
+        self.launch_envs: list[dict[str, str]] = []
         self.stops = 0
         self.plan_payload: dict | None = None
 
@@ -126,6 +128,7 @@ class FakeExecutor(parity.Executor):
 
     def launch(self, rendered, cwd, env, log_path, port) -> parity.Launch:
         self.launches.append((rendered, port))
+        self.launch_envs.append(dict(env))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(self.log_text, encoding="utf-8")
         return parity.Launch(FakeProcess(), log_path)
@@ -148,6 +151,7 @@ def make_options(tmp_path: Path, *, dry_run: bool = False, variables: dict[str, 
         stop_grace=2.0,
         variables={} if variables is None else variables,
         dry_run=dry_run,
+        allow_single_command=False,
     )
 
 
@@ -261,6 +265,7 @@ def test_manifest_carries_the_plan_fields_and_per_backend_facts(tmp_path, monkey
     assert manifest["backend_expected"] == ["mrv1", "mrv2"]
     assert manifest["config_yaml"].endswith("fake.yaml")
     assert manifest["compare_exit"] == 0
+    assert "backends.<backend>.log_sha256" in manifest["server_log_sha256_note"]
     for backend in parity.BACKENDS:
         entry = manifest["backends"][backend]
         assert entry["readiness_s"] == 0.0
@@ -519,7 +524,7 @@ def test_run_dry_run_on_a_real_config_writes_nothing(tmp_path, capsys):
             [
                 "run",
                 "--configs",
-                "GLM-5.2-W8A8C8-MTP-A5-dual-nodes",
+                "glm-5.2-W4A8C8-DSpark-PCP",
                 "--dest",
                 str(tmp_path / "dest"),
                 "--data-dir",
@@ -531,10 +536,14 @@ def test_run_dry_run_on_a_real_config_writes_nothing(tmp_path, capsys):
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["dry_run"] is True
-    assert payload["config_yaml"] == DEPLOYMENT_CONFIG
+    assert payload["command_count"] == 1
+    assert payload["single_command_override"] is False
+    assert payload["ignored_commands"] == {"mrv1": 0, "mrv2": 0}
+    assert payload["unresolved_variables"] == []
+    assert payload["config_yaml"].endswith("glm-5.2-W4A8C8-DSpark-PCP.yaml")
     assert len(payload["backends"]) == 2
     assert payload["backends"][0]["env_overrides"]["SERVER_PORT"] == str(payload["backends"][0]["port"])
-    assert payload["backends"][0]["serve_command"].startswith("vllm serve Eco-Tech/GLM-5.2-W8A8C8-mxfp8")
+    assert payload["backends"][0]["serve_command"].startswith("vllm serve Eco-Tech/GLM-5.2-w4a8c8")
     assert not data.exists()
 
 
@@ -554,7 +563,10 @@ def test_run_dry_run_reports_missing_placeholders(tmp_path, capsys):
         )
         == 2
     )
-    assert "unresolved placeholder" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "DP_SIZE" in captured.out
+    assert "PYTHON_LIB_DIR" in captured.out
+    assert "serve commands" in captured.err
     assert not (tmp_path / "data").exists()
 
 
@@ -581,7 +593,8 @@ def test_load_plans_reads_the_plan_json_and_the_copy_env(tmp_path):
         ]
     }
     records: list[dict] = []
-    plans = parity.load_plans(["fake"], tmp_path / "data", make_options(tmp_path), executor, records)
+    plans, problems = parity.load_plans(["fake"], tmp_path / "data", make_options(tmp_path), executor, records)
+    assert problems == []
     assert [record["stage"] for record in records] == ["plan"]
     assert len(plans) == 1
     assert plans[0].model == "org/model"
@@ -590,3 +603,211 @@ def test_load_plans_reads_the_plan_json_and_the_copy_env(tmp_path):
     assert plans[0].data_dir == tmp_path / "data"
     plan_argv = records[0]["argv"]
     assert plan_argv[plan_argv.index("--only") + 1] == "fake.yaml"
+
+
+def plan_payload(copy: Path, count: int = 1, carrier: str = "test_cases") -> dict:
+    commands = [{"display": "vllm serve org/model --port $SERVER_PORT", "model": "org/model"} for _ in range(count)]
+    return {
+        "configs": [
+            {
+                "path": "tests/e2e/cases/models/configs/GLM/fake.yaml",
+                "carrier": carrier,
+                "targets": {backend: {"dest": str(copy), "commands": commands} for backend in parity.BACKENDS},
+            }
+        ]
+    }
+
+
+def test_allow_single_command_records_ignored_commands(tmp_path):
+    copy = tmp_path / "copy.yaml"
+    copy.write_text(CASE_FIXTURE, encoding="utf-8")
+    executor = FakeExecutor()
+    executor.plan_payload = plan_payload(copy, count=2)
+    options = replace(make_options(tmp_path), allow_single_command=True)
+    plans, problems = parity.load_plans(["fake"], tmp_path / "data", options, executor, [])
+    assert problems == []
+    assert plans[0].single_command_override is True
+    assert plans[0].command_count == 2
+    assert plans[0].command_counts == {"mrv1": 2, "mrv2": 2}
+
+
+def test_allow_single_command_override_reaches_the_manifest(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.command_counts = {"mrv1": 2, "mrv2": 2}
+    plan.command_count = 2
+    plan.single_command_override = True
+    assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    assert manifest["single_command_override"] is True
+    assert manifest["command_count"] == 2
+    assert manifest["backends"]["mrv1"]["ignored_commands"] == 1
+    assert manifest["backends"]["mrv2"]["ignored_commands"] == 1
+    assert "backends.<backend>.log_sha256" in manifest["server_log_sha256_note"]
+
+
+def test_dry_run_payload_exposes_command_counts_and_ignored(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.command_counts = {"mrv1": 3, "mrv2": 3}
+    plan.command_count = 3
+    plan.single_command_override = True
+    assert parity.execute_config(plan, make_options(tmp_path, dry_run=True), FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command_count"] == 3
+    assert payload["single_command_override"] is True
+    assert payload["ignored_commands"] == {"mrv1": 2, "mrv2": 2}
+    assert payload["backends"][0]["ignored_commands"] == 2
+    assert payload["unresolved_variables"] == []
+
+
+def test_real_multi_command_dry_run_reports_the_truncation(tmp_path, capsys):
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-MTP-A5-dual-nodes",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert "2 serve commands" in captured.err
+    assert "MASTER_IP" in captured.out
+    assert not (tmp_path / "data").exists()
+
+
+def test_allow_single_command_still_refuses_multi_node(tmp_path, capsys):
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-MTP-A5-dual-nodes",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--dry-run",
+                "--allow-single-command",
+            ]
+        )
+        == 2
+    )
+    assert "num_nodes=2" in capsys.readouterr().err
+
+
+def test_allow_single_command_still_refuses_external_templates(tmp_path, capsys):
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-layerwise-PD",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--dry-run",
+                "--allow-single-command",
+            ]
+        )
+        == 2
+    )
+    assert "external_templates" in capsys.readouterr().err
+
+
+def test_pd_and_multinode_detection():
+    assert parity.is_pd_config("GLM-5.2-W8A8C8-layerwise-PD.yaml", "")
+    assert parity.is_pd_config("x.yaml", "kv-transfer-config: {}")
+    assert parity.is_pd_config("x.yaml", "env_prefill: &env_prefill")
+    assert not parity.is_pd_config("GLM-5.2-W8A8C8-MTP-A5-dual-nodes.yaml", "env_common: &env_common")
+    assert parity.config_num_nodes("num_nodes: 4\nmodel: x\n") == 4
+    assert parity.config_num_nodes("model: x\n") is None
+    assert parity.single_command_problem("a.yaml", 1, None, None, False, True) is None
+    assert "serve commands" in parity.single_command_problem("a.yaml", 2, "test_cases", 1, False, False)
+    assert "external_templates" in parity.single_command_problem("a.yaml", 2, "external_templates", 1, False, True)
+    assert "num_nodes=4" in parity.single_command_problem("a.yaml", 2, "deployment", 4, False, True)
+    assert "PD" in parity.single_command_problem("a-PD.yaml", 2, "deployment", 1, True, True)
+
+
+def test_unresolved_bare_variable_aborts_before_launch(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --master-addr $MASTER_IP")
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    manifest = read_manifest(plan)
+    assert "unresolved variable" in manifest["abort_reason"]
+    assert "MASTER_IP" in manifest["abort_reason"]
+    assert executor.launches == []
+
+
+def test_unresolved_variable_in_an_env_value_aborts(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, env={"LD_LIBRARY_PATH": "$PYTHON_LIB_DIR:/usr/lib"})
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    reason = read_manifest(plan)["abort_reason"]
+    assert "PYTHON_LIB_DIR" in reason
+    assert "env:LD_LIBRARY_PATH" in reason
+    assert executor.launches == []
+
+
+def test_var_option_is_injected_into_the_child_env(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path, command="vllm serve org/model --master-addr $MASTER_IP")
+    executor = FakeExecutor()
+    options = make_options(tmp_path, variables={"MASTER_IP": "10.0.0.9"})
+    assert parity.execute_config(plan, options, executor) == 0
+    assert executor.launch_envs[0]["MASTER_IP"] == "10.0.0.9"
+
+
+def test_dry_run_reports_unresolved_variables_and_exits_two(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(
+        tmp_path, command="vllm serve org/model --master-addr $MASTER_IP", env={"LD_LIBRARY_PATH": "$PYTHON_LIB_DIR"}
+    )
+    assert parity.execute_config(plan, make_options(tmp_path, dry_run=True), FakeExecutor()) == 2
+    payload = json.loads(capsys.readouterr().out)
+    entries = payload["unresolved_variables"]
+    assert {item["variable"] for item in entries} == {"MASTER_IP", "PYTHON_LIB_DIR"}
+    assert {item["location"] for item in entries} == {"command", "env:LD_LIBRARY_PATH"}
+    assert not (plan.data_dir / "manifest.json").exists()
+
+
+def test_resolving_the_variables_lets_dry_run_pass(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(
+        tmp_path, command="vllm serve org/model --master-addr $MASTER_IP", env={"LD_LIBRARY_PATH": "$PYTHON_LIB_DIR"}
+    )
+    options = make_options(tmp_path, dry_run=True, variables={"MASTER_IP": "10.0.0.9", "PYTHON_LIB_DIR": "/usr/lib"})
+    assert parity.execute_config(plan, options, FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unresolved_variables"] == []
+
+
+def test_real_layerwise_dry_run_lists_the_env_variable(tmp_path, capsys):
+    assert (
+        parity.main(
+            [
+                "run",
+                "--configs",
+                "GLM-5.2-W8A8C8-layerwise-PD",
+                "--dest",
+                str(tmp_path / "dest"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert "PYTHON_LIB_DIR" in captured.out
+    assert "serve commands" in captured.err
