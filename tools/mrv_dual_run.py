@@ -276,7 +276,9 @@ def shell_join(tokens: list[str]) -> str:
     shell metacharacters) is single-quoted by ``shlex.quote`` and stays one token.
     """
     return " ".join(
-        token if PURE_VARIABLE_PATTERN.match(token) or SHELL_SAFE_TOKEN_PATTERN.match(token) else shlex.quote(token)
+        token
+        if PURE_VARIABLE_PATTERN.fullmatch(token) or SHELL_SAFE_TOKEN_PATTERN.fullmatch(token)
+        else shlex.quote(token)
         for token in tokens
     )
 

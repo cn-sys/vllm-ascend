@@ -685,3 +685,21 @@ def test_existing_test_cases_display_expands_the_port_when_launched(tmp_path, ca
     launch_shell(tmp_path, f"printf '%s' {raw} > '{posix_path(target)}'", {"SERVER_PORT": "18080"})
     assert raw == "$SERVER_PORT"
     assert target.read_text(encoding="utf-8").strip() == "18080"
+
+
+def test_shell_join_quotes_tokens_with_a_trailing_newline(tmp_path):
+    """A newline-bearing token must stay data: leaving it raw would start a second command."""
+    assert dual.shell_join(["$SERVER_PORT"]) == "$SERVER_PORT"
+    assert dual.shell_join(["--port"]) == "--port"
+    dirty = "SAFE\n"
+    assert dual.shell_join([dirty]) == shlex.quote(dirty)
+    assert dual.shell_join(["$SERVER_PORT\n"]) == shlex.quote("$SERVER_PORT\n")
+    marker = tmp_path / "injected.txt"
+    tokens = ["printf", "%s", dirty, "touch", posix_path(marker)]
+    joined = dual.shell_join(tokens)
+    assert shlex.split(joined) == tokens
+    assert joined.startswith("printf %s 'SAFE\n'")
+    logged = launch_shell(tmp_path, joined)
+    # With a raw newline the shell would run `touch <marker>` as a second command.
+    assert not marker.exists()
+    assert logged.splitlines()[0] == "SAFE"
