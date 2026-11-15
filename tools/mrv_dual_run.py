@@ -263,6 +263,24 @@ def parse_scalar(raw: str) -> str | None:
     return (text.split(" #", 1)[0].strip() or None) if " #" in text else text
 
 
+SHELL_SAFE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
+PURE_VARIABLE_PATTERN = re.compile(r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})$")
+BARE_VARIABLE_PATTERN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+
+
+def shell_join(tokens: list[str]) -> str:
+    """Join argv tokens so that ``sh -c`` keeps the yaml semantics.
+
+    Plain tokens and pure ``$NAME``/``${NAME}`` references stay unquoted so the
+    shell still expands them from the child env; anything else (spaces, quotes,
+    shell metacharacters) is single-quoted by ``shlex.quote`` and stays one token.
+    """
+    return " ".join(
+        token if PURE_VARIABLE_PATTERN.match(token) or SHELL_SAFE_TOKEN_PATTERN.match(token) else shlex.quote(token)
+        for token in tokens
+    )
+
+
 def find_key_line(lines: list[str], start: int, end: int, key: str) -> tuple[int, int, str] | None:
     """First line in ``[start, end)`` that assigns ``key``, with its indent and raw tail."""
     pattern = re.compile(r"^(?P<indent>[ \t]*)" + re.escape(key) + r"[ \t]*:(?P<rest>.*)$")
@@ -350,7 +368,10 @@ def command_record(node: str, display: str, source: str, notes: list[str] | None
         "argv": argv,
         # A command whose argv is not trustworthy cannot be executed as-is, so it
         # needs the runner to render it, just like the placeholder and JSON cases.
-        "requires_runner_render": bool(placeholders) or bool(BRACED_SPACE_PATTERN.search(display)) or argv is None,
+        "requires_runner_render": bool(placeholders)
+        or bool(BRACED_SPACE_PATTERN.search(display))
+        or BARE_VARIABLE_PATTERN.search(display) is not None
+        or argv is None,
         "placeholders": placeholders,
         "source": source,
         "model": model_of_command(display),
@@ -423,7 +444,7 @@ def extract_test_cases(lines: list[str], sections: list[Section], section: Secti
             if alias is None:
                 raise CommandNotFound(f"test_cases[{number}].server_cmd has an unreadable alias {raw!r}")
             command, source = (
-                shlex.join(anchor_list_args(lines, sections, alias.group("name"))),
+                shell_join(anchor_list_args(lines, sections, alias.group("name"))),
                 f"*{alias.group('name')}",
             )
         elif raw:
@@ -431,13 +452,13 @@ def extract_test_cases(lines: list[str], sections: list[Section], section: Secti
         else:
             # Keep the arguments shell-safe: a JSON argument with spaces must
             # stay one token when the executor passes the display to sh -c.
-            command, source = shlex.join(block_list_items(lines, key_index, key_indent)), "block list"
+            command, source = shell_join(block_list_items(lines, key_index, key_indent)), "block list"
         if not command:
             raise CommandNotFound(f"test_cases[{number}].server_cmd is empty")
         if model_of_command(command) is None:
             if not model:
                 raise CommandNotFound(f"test_cases[{number}].server_cmd lists only flags and the case has no model")
-            command = shlex.join(["vllm", "serve", model, *shlex.split(command)])
+            command = shell_join(["vllm", "serve", model, *shlex.split(command)])
             notes.append(
                 "'vllm serve <model>' prefix added: the case runner composes it before the server_cmd arguments"
             )

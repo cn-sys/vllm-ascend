@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 import yaml
 
 from tools import mrv_dual_run as dual
+from tools import mrv_parity_run as parity
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ENV_VAR = dual.BACKEND_ENV_VAR
@@ -566,7 +568,15 @@ def test_plan_keeps_test_cases_json_arguments_as_single_tokens(capsys):
     case = yaml.safe_load((REPO_ROOT / entry["path"]).read_text(encoding="utf-8"))["test_cases"][0]
     assert tokens == ["vllm", "serve", case["model"], *case["server_cmd"]]
     assert len(tokens) == 45
-    assert command["argv"] == tokens
+    assert "--port $SERVER_PORT" in command["display"]
+    assert command["requires_runner_render"] is True
+
+
+def test_requires_runner_render_covers_a_bare_variable(capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    entry = next(item for item in payload["configs"] if item["path"].endswith("DSpark-PCP.yaml"))
+    command = entry["targets"]["mrv1"]["commands"][0]
+    assert "$SERVER_PORT" in command["display"]
     assert command["requires_runner_render"] is True
 
 
@@ -578,7 +588,8 @@ def test_a2_single_node_display_has_thirty_shell_tokens(capsys):
     case = yaml.safe_load((REPO_ROOT / entry["path"]).read_text(encoding="utf-8"))["test_cases"][0]
     assert tokens == ["vllm", "serve", case["model"], *case["server_cmd"]]
     assert len(tokens) == 30
-    assert command["argv"] == tokens
+    assert "--port $SERVER_PORT" in command["display"]
+    assert command["requires_runner_render"] is True
     assert tokens.count("--tensor-parallel-size") == 1
     assert any(token.startswith('{"cudagraph_mode"') and " " in token for token in tokens)
 
@@ -624,3 +635,53 @@ def test_plan_never_claims_an_argv_that_does_not_round_trip(capsys):
                     assert command["requires_runner_render"] is True
                 else:
                     assert shlex.join(command["argv"]) == " ".join(command["display"].split())
+
+
+def launch_shell(tmp_path: Path, command: str, env_extra: dict[str, str] | None = None) -> str:
+    """Run one command through the real Executor.launch and return its stdout log."""
+    log = tmp_path / "launch.log"
+    executor = parity.Executor()
+    launch = executor.launch(command, REPO_ROOT, {**os.environ, **(env_extra or {})}, log, 0)
+    executor.stop(launch, 30)
+    assert launch.process.returncode == 0
+    return log.read_text(encoding="utf-8", errors="replace")
+
+
+def posix_path(path: Path) -> str:
+    """The path form that the sh -c used by Executor.launch understands."""
+    return str(path).replace("\\", "/")
+
+
+def display_port_token(display: str) -> str:
+    """The exact text the display writes after --port (quoted or not)."""
+    return display.split("--port ", 1)[1].split(" ", 1)[0]
+
+
+def test_executor_launch_expands_the_port_variable(tmp_path):
+    target = tmp_path / "port.txt"
+    command = f"printf '%s' \"$SERVER_PORT\" > '{posix_path(target)}'"
+    logged = launch_shell(tmp_path, command, {"SERVER_PORT": "18080"})
+    assert target.read_text(encoding="utf-8").strip() == "18080"
+    assert logged == ""
+
+
+def test_a2_single_node_display_expands_the_port_when_launched(tmp_path, capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    entry = next(item for item in payload["configs"] if item["path"].endswith("GLM5_1-W8A8-A2-single-node.yaml"))
+    display = entry["targets"]["mrv1"]["commands"][0]["display"]
+    raw = display_port_token(display)
+    target = tmp_path / "a2-port.txt"
+    launch_shell(tmp_path, f"printf '%s' {raw} > '{posix_path(target)}'", {"SERVER_PORT": "18080"})
+    assert raw == "$SERVER_PORT"
+    assert target.read_text(encoding="utf-8").strip() == "18080"
+
+
+def test_existing_test_cases_display_expands_the_port_when_launched(tmp_path, capsys):
+    payload = cli_json(capsys, ["plan", "--print-only", "--dest", str(REPO_ROOT / "ignored")])
+    entry = next(item for item in payload["configs"] if item["path"].endswith("SFA-DCP.yaml"))
+    display = entry["targets"]["mrv1"]["commands"][0]["display"]
+    raw = display_port_token(display)
+    target = tmp_path / "sfa-port.txt"
+    launch_shell(tmp_path, f"printf '%s' {raw} > '{posix_path(target)}'", {"SERVER_PORT": "18080"})
+    assert raw == "$SERVER_PORT"
+    assert target.read_text(encoding="utf-8").strip() == "18080"
