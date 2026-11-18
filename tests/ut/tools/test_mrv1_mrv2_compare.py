@@ -919,7 +919,7 @@ def test_single_sided_missing_one_of_a_thousand_fails(tmp_path: Path):
     assert "## Verdict: FAIL" in report
 
 
-def test_both_sides_missing_ten_percent_is_inconclusive(tmp_path: Path):
+def test_missing_ten_percent_drops_coverage_below_the_threshold(tmp_path: Path):
     """D1/D2: 10% both-missing evidence leaves coverage below 0.90 for a real sample."""
     tokens_a = ["A", "B"] + [f"t{index}" for index in range(18)]
     tokens_b = ["X", "Y"] + list(tokens_a[2:])
@@ -940,7 +940,7 @@ def test_both_sides_missing_ten_percent_is_inconclusive(tmp_path: Path):
     assert "## Verdict: INCONCLUSIVE" in report
 
 
-def test_both_sides_missing_one_percent_can_pass(tmp_path: Path):
+def test_coverage_above_the_threshold_passes(tmp_path: Path):
     tokens = [f"t{index}" for index in range(100)]
     logprobs_a = [-0.1] * 100
     logprobs_b = [-0.1] * 100
@@ -997,3 +997,22 @@ def test_negative_min_comparable_positions_is_input_error(tmp_path: Path, capsys
     assert code == compare_tool.EXIT_INPUT_ERROR
     assert "must not be negative" in capsys.readouterr().err
     assert not out.exists()
+
+
+def test_coverage_equal_to_threshold_passes(tmp_path: Path):
+    """Strict less-than: 9/10 = 90.00% coverage is not below the 0.90 default, so it passes."""
+    tokens = [f"t{index}" for index in range(10)]
+    logprobs_a = [-0.1] * 10
+    logprobs_b = [-0.1] * 10
+    logprobs_a[0] = None
+    logprobs_b[0] = None
+    records_a = [make_record("p1", tokens, logprobs_a, backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", tokens, logprobs_b, backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "10"
+    )
+
+    assert code == compare_tool.EXIT_OK
+    assert "| logprob coverage (all records) | 90.00% |" in report
+    assert "## Verdict: PASS" in report

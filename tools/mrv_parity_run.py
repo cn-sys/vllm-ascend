@@ -43,8 +43,10 @@ NPU run would.
 Only the standard library plus ``regex`` (the repository lint whitelist) is
 imported. No command is ever handed to a shell keyword: the serve command is
 rendered as one string and passed to ``Popen(["sh", "-c", rendered])``, and no
-display string is split into tokens. Exit codes: 0 parity holds, 1 compare
-reports a mismatch, 2 input, placeholder, readiness, gate or collect failure.
+display string is split into tokens. Exit codes: 0 parity holds (PASS), 1 the
+comparison reports a mismatch (FAIL), 2 unusable input, placeholder, readiness,
+gate or collect failure, or the comparison is INCONCLUSIVE (evidence
+insufficient).
 """
 
 # ruff: noqa: E402
@@ -125,34 +127,22 @@ IDENTITY_FIELDS = ("image_tag", "cann_version", "torch_npu_version", "model_revi
 STUB_WARNING = "stub rehearsal output, not real measurement"
 SIGNAL_ABORT_REASON: str | None = None
 COMPARE_VERDICTS = {EXIT_OK: "pass", EXIT_MISMATCH: "fail", EXIT_INPUT_ERROR: "inconclusive"}
+REPORT_FRESHNESS_SLACK_NS = 2_000_000_000
 DEFAULT_COLLECT_TIMEOUT = 3600.0
 DEFAULT_STOP_GRACE = 10.0
 DEFAULT_HEALTH_URL = "http://127.0.0.1:${PORT}/health"
 DEFAULT_BASE_URL = "http://127.0.0.1:${PORT}"
-DEFAULT_SERVE_COMMAND = "{python} {tool} _stub-server --port ${PORT} --backend ${BACKEND} --log-mode ${STUB_LOG_MODE}"
-STUB_LOG_MODES = ("explicit", "unset", "fallback", "both")
-STUB_PROMPT_TOKENS = (
-    "stub",
-    "token",
-    "one",
-    "two",
-    "three",
-    "four",
-    "five",
-    "six",
-    "seven",
-    "eight",
-    "nine",
-    "ten",
-    "eleven",
-    "twelve",
-    "thirteen",
-    "fourteen",
+DEFAULT_SERVE_COMMAND = (
+    "{python} {tool} _stub-server --port ${PORT} --backend ${BACKEND} --log-mode ${STUB_LOG_MODE} "
+    "--tokens ${STUB_TOKENS}"
 )
+STUB_LOG_MODES = ("explicit", "unset", "fallback", "both")
+STUB_PROMPT_TOKENS = ("stub", "token") + tuple(f"word{index}" for index in range(2, 32))
 STUB_PROMPT_LOGPROBS = tuple(-0.1 * (index + 1) for index in range(len(STUB_PROMPT_TOKENS)))
 HEALTH_POLL_SECONDS = 0.2
 RESERVED_VARIABLES = (RUNNER_ENV, "SERVER_PORT", "PORT", "BACKEND", "CONFIG")
 LIVE_PROCESSES: set[Any] = set()
+LIVE_PORTS: set[int] = set()
 EXAMPLES = """examples:
   python tools/mrv_parity_run.py rehearse --stub --data-dir /tmp/t4rehearse
   python tools/mrv_parity_run.py run --configs GLM-5.2-W8A8C8-MTP-A5-dual-nodes --dest /tmp/t4dest \
@@ -184,19 +174,44 @@ def _process_group_available() -> bool:
     return hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 
+def kill_process_tree(process: Any) -> None:
+    """Kill the whole server tree: taskkill /T on Windows, the process group on POSIX."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+        return
+    if _process_group_available():
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            return
+    with contextlib.suppress(OSError):
+        process.terminate()
+
+
+def kill_port_owners(port: int) -> None:
+    """Kill whatever still listens on our port; the fallback when the shell tree is already gone."""
+    if not port_is_open(port):
+        return
+    for pid in port_owner_pids(port):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+        else:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
 def terminate_process_groups() -> None:
-    """SIGTERM every live server process group; used by the signal handler and atexit."""
+    """Kill every live server process group; used by the signal handler and atexit."""
     for process in list(LIVE_PROCESSES):
         try:
             if process.poll() is not None:
                 continue
-            if _process_group_available():
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            else:
-                process.terminate()
+            kill_process_tree(process)
         except (OSError, AttributeError):
             with contextlib.suppress(OSError):
                 process.terminate()
+    for port in list(LIVE_PORTS):
+        with contextlib.suppress(OSError):
+            kill_port_owners(port)
 
 
 def cleanup_live_processes() -> None:
@@ -224,7 +239,7 @@ def handle_termination(signum: int, frame: Any) -> None:
 def install_signal_handlers() -> list[str]:
     """Install SIGTERM/SIGINT/SIGHUP handlers; returns the names that were installed."""
     installed: list[str] = []
-    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
         signum = getattr(signal, name, None)
         if signum is None:
             continue
@@ -254,6 +269,7 @@ class Launch:
 
     process: Any
     log_path: Path
+    port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -355,22 +371,26 @@ class Executor:
                 start_new_session=True,
             )
         LIVE_PROCESSES.add(process)
-        return Launch(process, log_path)
+        LIVE_PORTS.add(port)
+        return Launch(process, log_path, port)
 
     def stop(self, launch: Launch, grace: float) -> int | None:
-        """Stop a server: SIGTERM (or taskkill /T on Windows), then kill, then reap."""
+        """Stop a server tree: taskkill /T on Windows, SIGTERM to the POSIX group, then reap."""
         process = launch.process
-        if process.poll() is None:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
-            else:
-                try:
-                    if _process_group_available():
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    else:
-                        process.terminate()
-                except OSError:
+        if os.name == "nt":
+            # Always taskkill: the shell may already be reaped while its grandchildren (the
+            # real server) are still alive, and taskkill /T on the pid is the Windows way to
+            # reach them.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+        elif process.poll() is None:
+            try:
+                if _process_group_available():
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                else:
                     process.terminate()
+            except OSError:
+                process.terminate()
+        if process.poll() is None:
             try:
                 process.wait(timeout=grace)
             except subprocess.TimeoutExpired:
@@ -385,6 +405,9 @@ class Executor:
                     except OSError:
                         process.kill()
                 process.wait(timeout=grace)
+        if launch.port is not None:
+            kill_port_owners(launch.port)
+            LIVE_PORTS.discard(launch.port)
         LIVE_PROCESSES.discard(process)
         return process.returncode
 
@@ -645,7 +668,7 @@ def record_command(
             "backend": backend,
             "argv": list(argv),
             "cwd": str(cwd),
-            "env": dict(env_overrides),
+            "env": {key: value for key, value in env_overrides.items() if key in CHILD_ENV_KEYS},
             "returncode": result.returncode,
         }
     )
@@ -870,17 +893,62 @@ def prepare_data_dir(data_dir: Path, reuse: bool) -> tuple[bool, list[str]]:
     """Refuse a non-empty data dir unless --reuse-dir; archive the previous comparison report."""
     if not data_dir.exists():
         return False, []
+    if data_dir.is_file():
+        raise InputError(f"--data-dir {data_dir} is a regular file, not a directory")
     if not any(data_dir.iterdir()):
         return False, []
     if not reuse:
         raise InputError(f"--data-dir {data_dir} already exists and is not empty; pass --reuse-dir to continue in it")
     archived: list[str] = []
-    compare_md = data_dir / "compare.md"
-    if compare_md.is_file():
-        previous = data_dir / "compare.prev.md"
-        compare_md.replace(previous)
-        archived.append(str(previous))
+    for name, previous_name in (("compare.md", "compare.prev.md"), ("compare.json", "compare.prev.json")):
+        report = data_dir / name
+        if report.is_file():
+            previous = data_dir / previous_name
+            report.replace(previous)
+            archived.append(str(previous))
     return True, archived
+
+
+def port_owner_pids(port: int) -> list[int]:
+    """Best-effort PIDs listening on a port; only used for the residual-server report."""
+    if os.name == "nt":
+        result = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False)
+        pids: set[int] = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 5 and fields[0] == "TCP" and fields[1].endswith(f":{port}") and fields[3] == "LISTENING":
+                with contextlib.suppress(ValueError):
+                    pids.add(int(fields[4]))
+        return sorted(pids)
+    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, check=False)
+    pids = set()
+    for token in result.stdout.split():
+        with contextlib.suppress(ValueError):
+            pids.add(int(token))
+    return sorted(pids)
+
+
+def report_residual_servers(ports: list[int]) -> bool:
+    """Print every port still listening after a run; False means a server leaked."""
+    leaked = False
+    for port in ports:
+        if not port_is_open(port):
+            continue
+        leaked = True
+        pids = port_owner_pids(port)
+        pid_text = ", ".join(str(pid) for pid in pids) if pids else "unknown"
+        print(
+            f"error: residual server still listening on port {port} (pid {pid_text}); "
+            "the server process tree did not stop",
+            file=sys.stderr,
+        )
+    return not leaked
+
+
+def validate_readiness_timeout(value: float | None) -> None:
+    """Reject a nonsensical readiness budget before it reaches the manifest."""
+    if value is not None and value <= 0:
+        raise InputError(f"--readiness-timeout must be positive, got {value:g}")
 
 
 def build_manifest(
@@ -928,6 +996,10 @@ def build_manifest(
     manifest["dest"] = str(options.dest)
     manifest["abort_reason"] = abort_reason
     manifest["compare_exit"] = compare.get("exit")
+    if manifest["compare_exit"] is None:
+        compare_records = [record for record in records if record["stage"] == "compare"]
+        if compare_records:
+            manifest["compare_exit"] = compare_records[0]["returncode"]
     manifest["compare_verdict"] = compare.get("verdict")
     manifest["compare_md"] = compare.get("md")
     manifest["compare_json"] = compare.get("json")
@@ -956,16 +1028,23 @@ def run_compare(
         raise Aborted("compare requested but a collect file is missing")
     base = [sys.executable, str(COMPARE_TOOL), "compare", "--a", str(collect_a), "--b", str(collect_b)]
     info: dict[str, Any] = {"exit": None, "verdict": None, "md": None, "json": None}
+    started_ns = time.time_ns()
     for suffix, path in (("md", plan.data_dir / "compare.md"), ("json", plan.data_dir / "compare.json")):
         argv = [*base, "--out", str(path)]
         result = executor.run(argv, REPO_ROOT, None, None)
         record_command(records, "compare", None, argv, REPO_ROOT, {}, result)
         # Exit 0/1/2 are all verdicts the compare tool can legitimately reach;
-        # a regression (no report file) or any other code is a pipeline failure.
+        # any other code, a missing report or a leftover one is a pipeline failure.
         if result.returncode not in COMPARE_VERDICTS:
             raise Aborted(f"compare crashed with {result.returncode}: {result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
         if not path.is_file():
-            raise Aborted(f"compare exited {result.returncode} but wrote no {path.name}: {result.stderr.strip()}")
+            raise Aborted(f"compare exited {result.returncode} and produced no {path.name} this run ({detail})")
+        if path.stat().st_mtime_ns < started_ns - REPORT_FRESHNESS_SLACK_NS:
+            raise Aborted(
+                f"refusing stale {path.name} from an earlier run at {path}: "
+                "the report predates this run (pass --reuse-dir to archive old reports)"
+            )
         info[suffix] = str(path)
         verdict = COMPARE_VERDICTS[result.returncode]
         if suffix == "md":
@@ -1197,8 +1276,10 @@ def stub_command() -> str:
 
 def rehearse_options(args: argparse.Namespace) -> Options:
     """Options for a rehearsal: identical to a real run except for the serve command."""
+    validate_readiness_timeout(args.readiness_timeout)
     variables = parse_variables(args.var)
     variables["STUB_LOG_MODE"] = args.log_mode
+    variables["STUB_TOKENS"] = str(args.stub_tokens)
     return Options(
         dest=Path(args.data_dir) / "dest",
         requests=Path(args.requests),
@@ -1225,6 +1306,8 @@ def run_rehearse(args: argparse.Namespace) -> int:
     """Entry point of ``rehearse``: the real orchestration with a stub server."""
     if not args.stub:
         return fail("rehearse currently only supports --stub; pass --stub to confirm the stub server")
+    if args.stub_tokens <= 0:
+        return fail(f"--stub-tokens must be positive, got {args.stub_tokens}")
     serve_cmd = args.serve_cmd or stub_command()
     try:
         options = rehearse_options(args)
@@ -1241,15 +1324,25 @@ def run_rehearse(args: argparse.Namespace) -> int:
         )
     except (InputError, OSError) as exc:
         return fail(str(exc))
-    return execute_config(plan, options, Executor())
+    code = execute_config(plan, options, Executor())
+    ports = [port_for(options.port_base, plan.index, backend) for backend in BACKENDS]
+    if not report_residual_servers(ports) and code == EXIT_OK:
+        return EXIT_INPUT_ERROR
+    return code
+
+
+def _residual_ports(plans: list[ConfigPlan], options: Options) -> list[int]:
+    """Every port the given plans would bind, for the end-of-run residual check."""
+    return [port_for(options.port_base, plan.index, backend) for plan in plans for backend in BACKENDS]
 
 
 def run_real(args: argparse.Namespace) -> int:
-    """Entry point of ``run``: the real configs, without a shell."""
+    """Entry point of the run subcommand: the real configs, without a shell."""
     slugs = [slug.strip() for slug in args.configs.split(",") if slug.strip()]
     if not slugs:
         return fail("--configs needs at least one config slug")
     try:
+        validate_readiness_timeout(args.readiness_timeout)
         options = Options(
             dest=Path(args.dest),
             requests=Path(args.requests),
@@ -1272,7 +1365,7 @@ def run_real(args: argparse.Namespace) -> int:
         )
         records: list[dict[str, Any]] = []
         plans, problems = load_plans(slugs, Path(args.data_dir), options, Executor(), records)
-    except (InputError, OSError, json.JSONDecodeError) as exc:
+    except (InputError, OSError, SignalAbort, json.JSONDecodeError) as exc:
         return fail(str(exc))
     if options.dry_run:
         exit_code = EXIT_INPUT_ERROR if problems else EXIT_OK
@@ -1293,12 +1386,18 @@ def run_real(args: argparse.Namespace) -> int:
         code = execute_config(plan, options, Executor(), records)
         exit_code = max(exit_code, code) if code != EXIT_OK else exit_code
         if code == EXIT_INPUT_ERROR:
+            if not report_residual_servers(_residual_ports(plans, options)) and exit_code == EXIT_OK:
+                return EXIT_INPUT_ERROR
             return code
+    if not report_residual_servers(_residual_ports(plans, options)) and exit_code == EXIT_OK:
+        return EXIT_INPUT_ERROR
     return exit_code
 
 
 class StubHandler(BaseHTTPRequestHandler):
     """Deterministic stand-in for the OpenAI completions endpoint."""
+
+    tokens: int = len(STUB_PROMPT_TOKENS)
 
     def log_message(self, *args: Any) -> None:
         """Keep the stub log to the runner line this tool has to verify."""
@@ -1328,6 +1427,8 @@ class StubHandler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] != "/v1/completions":
             self.send_json(404, {"error": "not found"})
             return
+        tokens = list(STUB_PROMPT_TOKENS[: self.tokens])
+        logprobs = list(STUB_PROMPT_LOGPROBS[: self.tokens])
         self.send_json(
             200,
             {
@@ -1337,11 +1438,8 @@ class StubHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "text": "stub token one two",
-                        "logprobs": {
-                            "tokens": list(STUB_PROMPT_TOKENS),
-                            "token_logprobs": list(STUB_PROMPT_LOGPROBS),
-                        },
+                        "text": " ".join(tokens),
+                        "logprobs": {"tokens": tokens, "token_logprobs": logprobs},
                         "finish_reason": "length",
                     }
                 ],
@@ -1367,7 +1465,7 @@ def run_stub_server(args: argparse.Namespace) -> int:
     """Entry point of the hidden ``_stub-server`` used by the rehearsal."""
     for line in runner_log_lines(args.backend, args.log_mode):
         print(line, flush=True)
-    handler = type("BoundStubHandler", (StubHandler,), {})
+    handler = type("BoundStubHandler", (StubHandler,), {"tokens": args.tokens})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"stub server listening on 127.0.0.1:{args.port}", flush=True)
     try:
@@ -1423,6 +1521,15 @@ def build_parser() -> argparse.ArgumentParser:
     rehearse.add_argument("--data-dir", required=True, help="directory that receives the run products")
     rehearse.add_argument("--serve-cmd", default=None, help="serve command template to launch instead of the stub")
     rehearse.add_argument("--log-mode", choices=STUB_LOG_MODES, default="explicit", help="runner line the stub prints")
+    rehearse.add_argument(
+        "--stub-tokens",
+        type=int,
+        default=len(STUB_PROMPT_TOKENS),
+        help=(
+            "number of tokens the stub server returns; below --min-comparable-positions "
+            "the compare step is inconclusive"
+        ),
+    )
     add_common_options(rehearse)
     rehearse.set_defaults(handler=run_rehearse)
     run = subparsers.add_parser("run", help="run the pipeline for one or more pinned GLM configs")
@@ -1441,6 +1548,7 @@ def build_parser() -> argparse.ArgumentParser:
     stub.add_argument("--port", type=int, required=True)
     stub.add_argument("--backend", choices=BACKENDS, default="mrv1")
     stub.add_argument("--log-mode", choices=STUB_LOG_MODES, default="explicit")
+    stub.add_argument("--tokens", type=int, default=len(STUB_PROMPT_TOKENS))
     stub.set_defaults(handler=run_stub_server)
     return parser
 
@@ -1449,7 +1557,11 @@ def main(argv: list[str] | None = None) -> int:
     """Parse argv, install the termination handlers and dispatch to the subcommand."""
     args = build_parser().parse_args(argv)
     install_signal_handlers()
-    return args.handler(args)
+    try:
+        return args.handler(args)
+    except SignalAbort as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
 
 
 if __name__ == "__main__":

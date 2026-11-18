@@ -65,7 +65,9 @@ formats):
 * ``--min-logprob-coverage`` (default 0.90): of the comparable positions, this
   share must carry a logprob on both sides, otherwise the record is inconclusive.
   This only constrains positions where both sides are missing; single-sided
-  gaps are handled by ``--max-single-sided-missing-ratio``.
+  gaps are handled by ``--max-single-sided-missing-ratio``. The threshold is a
+  lower bound compared with a strict less-than: a coverage exactly equal to it
+  passes (e.g. 0.90 with the default); only strictly less is inconclusive.
 
 Metric denominators: ``position_total = max(len(tokens_a), len(tokens_b))``;
 ``position_matches`` counts positions whose tokens are equal (the comparable
@@ -177,10 +179,11 @@ class CollectError(RuntimeError):
 class Thresholds:
     """Decision thresholds for the three-state verdict.
 
-    Evidence below a threshold makes a record INCONCLUSIVE (or FAIL for the
-    exact-match rule), never PASS: a run whose logprobs are missing everywhere,
-    or whose two samples share too few comparable positions, says nothing about
-    parity and must not be reported as a pass.
+    Evidence strictly below a threshold makes a record INCONCLUSIVE (or FAIL
+    for the exact-match rule; the single-sided ratio is a strict upper bound),
+    never PASS: a run whose logprobs are missing everywhere, or whose two
+    samples share too few comparable positions, says nothing about parity and
+    must not be reported as a pass. Exactly at a lower-bound threshold passes.
     """
 
     min_exact_match_rate: float = DEFAULT_MIN_EXACT_MATCH_RATE
