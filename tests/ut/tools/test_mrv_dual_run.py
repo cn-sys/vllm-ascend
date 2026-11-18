@@ -33,7 +33,7 @@ EXPECTED_PINS = {
     f"{GLM_DIR}/GLM-5.2-W8A8C8-layerwise-PD.yaml": (59, "0"),
     f"{GLM_DIR}/GLM-5.3-Flash-W8A8-130k-PD.yaml": (41, "1"),
     f"{GLM_DIR}/GLM5_1_W4A4_A5.yaml": (9, "1"),
-    f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml": (49, "1"),
+    f"{GLM_DIR}/GLM5_1-W8A8-A2-single-node.yaml": (54, "1"),
 }
 EXPECTED_CARRIERS = {
     "test_cases": {
@@ -703,3 +703,23 @@ def test_shell_join_quotes_tokens_with_a_trailing_newline(tmp_path):
     # With a raw newline the shell would run `touch <marker>` as a second command.
     assert not marker.exists()
     assert logged.splitlines()[0] == "SAFE"
+
+
+def test_a2_single_node_config_has_no_benchmark_landmine():
+    path = REPO_ROOT / GLM_DIR / "GLM5_1-W8A8-A2-single-node.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert "benchmarks" not in data
+
+    def keys(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield key
+                yield from keys(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from keys(item)
+
+    present = set(keys(data))
+    assert "baseline" not in present
+    assert "threshold" not in present
+    assert "T4 tools collect" in path.read_text(encoding="utf-8")

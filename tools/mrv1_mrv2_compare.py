@@ -56,10 +56,24 @@ formats):
 
 * ``--min-exact-match-rate`` (default 0.90): every non-greedy record must match
   this share of its token positions exactly, otherwise it fails.
-* ``--min-comparable-ratio`` (default 0.50): a record needs this share of
-  token-equal (comparable) positions, otherwise it is inconclusive.
+* ``--max-single-sided-missing-ratio`` (default 0.00): a position where exactly
+  one run carries a logprob is asymmetric evidence; above this share the record
+  fails. The default fails on any single-sided position.
+* ``--min-comparable-positions`` (default 16): absolute lower bound on the number
+  of token-equal (comparable) positions. Fewer positions cannot carry a verdict,
+  however consistent they look, so the record is inconclusive.
 * ``--min-logprob-coverage`` (default 0.90): of the comparable positions, this
   share must carry a logprob on both sides, otherwise the record is inconclusive.
+  This only constrains positions where both sides are missing; single-sided
+  gaps are handled by ``--max-single-sided-missing-ratio``.
+
+Metric denominators: ``position_total = max(len(tokens_a), len(tokens_b))``;
+``position_matches`` counts positions whose tokens are equal (the comparable
+positions, and also the numerator of ``exact_rate = position_matches /
+position_total``); ``single_sided_missing_ratio = missing_one_side /
+position_matches``; ``logprob_coverage = both_present / position_matches``.
+Decision order per record: structural failure, no tokens, non-greedy exact rate,
+single-sided missing ratio, comparable position count, logprob coverage, PASS.
 
 Failure semantics:
 
@@ -124,8 +138,9 @@ LOGPROB_TOP_K = 5
 MAX_LISTED_ITEMS = 5
 FRAGMENT_RADIUS = 2
 DEFAULT_MIN_EXACT_MATCH_RATE = 0.90
-DEFAULT_MIN_COMPARABLE_RATIO = 0.50
+DEFAULT_MIN_COMPARABLE_POSITIONS = 16
 DEFAULT_MIN_LOGPROB_COVERAGE = 0.90
+DEFAULT_MAX_SINGLE_SIDED_MISSING_RATIO = 0.0
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
@@ -164,20 +179,22 @@ class Thresholds:
 
     Evidence below a threshold makes a record INCONCLUSIVE (or FAIL for the
     exact-match rule), never PASS: a run whose logprobs are missing everywhere,
-    or whose two samples share no comparable position, says nothing about
+    or whose two samples share too few comparable positions, says nothing about
     parity and must not be reported as a pass.
     """
 
     min_exact_match_rate: float = DEFAULT_MIN_EXACT_MATCH_RATE
-    min_comparable_ratio: float = DEFAULT_MIN_COMPARABLE_RATIO
+    min_comparable_positions: int = DEFAULT_MIN_COMPARABLE_POSITIONS
     min_logprob_coverage: float = DEFAULT_MIN_LOGPROB_COVERAGE
+    max_single_sided_missing_ratio: float = DEFAULT_MAX_SINGLE_SIDED_MISSING_RATIO
 
-    def to_dict(self) -> dict[str, float]:
+    def to_dict(self) -> dict[str, float | int]:
         """JSON form of the thresholds, echoed by both report formats."""
         return {
             "min_exact_match_rate": self.min_exact_match_rate,
-            "min_comparable_ratio": self.min_comparable_ratio,
+            "min_comparable_positions": self.min_comparable_positions,
             "min_logprob_coverage": self.min_logprob_coverage,
+            "max_single_sided_missing_ratio": self.max_single_sided_missing_ratio,
         }
 
 
@@ -394,6 +411,7 @@ class TokenDiff:
     parsed_ok: bool
     exact_rate: float | None = None
     comparable_ratio: float | None = None
+    single_sided_missing_ratio: float | None = None
     logprob_coverage: float | None = None
     comparable_positions: int = 0
     missing_both_logprobs: int = 0
@@ -475,6 +493,7 @@ def compare_record(
     )
     exact_rate = position_matches / position_total if position_total else None
     comparable_ratio = exact_rate
+    single_sided_ratio = logprob_stats.missing_one_side / position_matches if position_matches else 0.0
     coverage = logprob_stats.positions / position_matches if position_matches else (0.0 if position_total else None)
     verdict = VERDICT_PASS
     verdict_reason = ""
@@ -490,11 +509,18 @@ def compare_record(
             f"non-greedy exact token match rate {exact_rate:.2%} is below "
             f"--min-exact-match-rate {thresholds.min_exact_match_rate:.0%}"
         )
-    elif comparable_ratio is not None and comparable_ratio < thresholds.min_comparable_ratio:
+    elif position_matches and single_sided_ratio > thresholds.max_single_sided_missing_ratio:
+        verdict = VERDICT_FAIL
+        verdict_reason = (
+            f"single-sided missing logprobs {logprob_stats.missing_one_side}/{position_matches} "
+            f"({single_sided_ratio:.2%}) exceed "
+            f"--max-single-sided-missing-ratio {thresholds.max_single_sided_missing_ratio:.2%}"
+        )
+    elif position_matches < thresholds.min_comparable_positions:
         verdict = VERDICT_INCONCLUSIVE
         verdict_reason = (
-            f"evidence insufficient: only {position_matches}/{position_total} comparable position(s) "
-            f"({comparable_ratio:.2%}) < --min-comparable-ratio {thresholds.min_comparable_ratio:.0%}"
+            f"evidence insufficient: only {position_matches} comparable position(s), "
+            f"--min-comparable-positions is {thresholds.min_comparable_positions}"
         )
     elif coverage is not None and coverage < thresholds.min_logprob_coverage:
         verdict = VERDICT_INCONCLUSIVE
@@ -517,6 +543,7 @@ def compare_record(
         parsed_ok=parsed_ok,
         exact_rate=exact_rate,
         comparable_ratio=comparable_ratio,
+        single_sided_missing_ratio=single_sided_ratio,
         logprob_coverage=coverage,
         comparable_positions=position_matches,
         missing_both_logprobs=logprob_stats.missing_both,
@@ -620,6 +647,7 @@ def summarize(report: ComparisonReport) -> dict[str, Any]:
     position_total = sum(diff.position_total for diff in report.diffs)
     position_matches = sum(diff.position_matches for diff in report.diffs)
     logprob_positions = sum(diff.logprob_positions for diff in report.diffs)
+    single_sided_missing = sum(diff.missing_one_side_logprobs for diff in report.diffs)
     logprob_delta_sum = sum(diff.logprob_delta_sum for diff in report.diffs)
     max_delta = max(
         (diff.max_logprob_delta for diff in report.diffs if diff.max_logprob_delta is not None),
@@ -647,7 +675,8 @@ def summarize(report: ComparisonReport) -> dict[str, Any]:
         "inconclusive_records": [diff.record_id for diff in report.diffs if diff.verdict == VERDICT_INCONCLUSIVE],
         "failed_records": [diff.record_id for diff in report.diffs if diff.verdict == VERDICT_FAIL],
         "exact_match_rate": _rate(position_matches, position_total),
-        "comparable_ratio": _rate(position_matches, position_total),
+        "comparable_positions_total": position_matches,
+        "single_sided_missing_ratio": _rate(single_sided_missing, position_matches),
         "logprob_coverage": _rate(logprob_positions, position_matches),
         "thresholds": report.thresholds.to_dict(),
         "verdict": report.verdict,
@@ -679,6 +708,7 @@ def report_to_dict(report: ComparisonReport, metrics: dict[str, Any]) -> dict[st
                 "exact_rate": diff.exact_rate,
                 "comparable_ratio": diff.comparable_ratio,
                 "comparable_positions": diff.comparable_positions,
+                "single_sided_missing_ratio": diff.single_sided_missing_ratio,
                 "logprob_coverage": diff.logprob_coverage,
                 "missing_both_logprobs": diff.missing_both_logprobs,
                 "missing_one_side_logprobs": diff.missing_one_side_logprobs,
@@ -711,8 +741,9 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         f"- max logprob delta allowed: {report.max_logprob_delta}",
         f"- greedy exact tokens required: {'yes' if report.greedy_require_exact else 'no'}",
         f"- min exact match rate (non-greedy): {report.thresholds.min_exact_match_rate}",
-        f"- min comparable ratio: {report.thresholds.min_comparable_ratio}",
+        f"- min comparable positions: {report.thresholds.min_comparable_positions}",
         f"- min logprob coverage: {report.thresholds.min_logprob_coverage}",
+        f"- max single-sided missing ratio: {report.thresholds.max_single_sided_missing_ratio}",
         f"- verdict: {report.verdict}",
         "",
         "## Summary",
@@ -732,12 +763,13 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         f"| max logprob delta | {_format_delta(metrics['max_logprob_delta'])} |",
         f"| mean logprob delta | {_format_delta(metrics['mean_logprob_delta'])} |",
         f"| parsed_ok rate | {_format_rate(metrics['parsed_ok_rate'])} |",
-        f"| exact match rate (all records) | {_format_rate(metrics['exact_match_rate'])} |",
-        f"| comparable ratio (all records) | {_format_rate(metrics['comparable_ratio'])} |",
+        f"| comparable positions (all records) | {metrics['comparable_positions_total']} |",
+        f"| single-sided missing ratio (all records) | {_format_rate(metrics['single_sided_missing_ratio'])} |",
         f"| logprob coverage (all records) | {_format_rate(metrics['logprob_coverage'])} |",
         f"| min exact match rate (non-greedy) | {_format_rate(report.thresholds.min_exact_match_rate)} |",
-        f"| min comparable ratio | {_format_rate(report.thresholds.min_comparable_ratio)} |",
+        f"| min comparable positions | {report.thresholds.min_comparable_positions} |",
         f"| min logprob coverage | {_format_rate(report.thresholds.min_logprob_coverage)} |",
+        f"| max single-sided missing ratio | {_format_rate(report.thresholds.max_single_sided_missing_ratio)} |",
         f"| missing ids | {_preview(report.missing_ids) if report.missing_ids else 'none'} |",
         f"| unexpected ids | {_preview(report.unexpected_ids) if report.unexpected_ids else 'none'} |",
         "",
@@ -751,7 +783,7 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for diff in report.diffs:
-        comparable = f"{diff.position_matches}/{diff.position_total} ({_format_rate(diff.comparable_ratio)})"
+        comparable = f"{diff.position_matches} pos ({_format_rate(diff.comparable_ratio)} of {diff.position_total})"
         coverage = f"{diff.logprob_positions}/{diff.position_matches} ({_format_rate(diff.logprob_coverage)})"
         lines.append(
             f"| `{diff.record_id}` | {'yes' if diff.greedy else 'no'} | {diff.tokens_a}/{diff.tokens_b} "
@@ -812,16 +844,19 @@ def build_thresholds(args: argparse.Namespace) -> Thresholds:
     """Validate the three rate thresholds and package them for the report."""
     values = {
         "--min-exact-match-rate": args.min_exact_match_rate,
-        "--min-comparable-ratio": args.min_comparable_ratio,
         "--min-logprob-coverage": args.min_logprob_coverage,
+        "--max-single-sided-missing-ratio": args.max_single_sided_missing_ratio,
     }
     for name, value in values.items():
         if not 0.0 <= float(value) <= 1.0:
             raise InputError(f"{name} must be within [0, 1], got {value!r}")
+    if int(args.min_comparable_positions) < 0:
+        raise InputError(f"--min-comparable-positions must not be negative, got {args.min_comparable_positions!r}")
     return Thresholds(
         min_exact_match_rate=float(args.min_exact_match_rate),
-        min_comparable_ratio=float(args.min_comparable_ratio),
+        min_comparable_positions=int(args.min_comparable_positions),
         min_logprob_coverage=float(args.min_logprob_coverage),
+        max_single_sided_missing_ratio=float(args.max_single_sided_missing_ratio),
     )
 
 
@@ -857,7 +892,8 @@ def run_compare(args: argparse.Namespace) -> int:
         f"PASS {metrics['records_passed']} / FAIL {metrics['records_failed']} "
         f"/ INCONCLUSIVE {metrics['records_inconclusive']}; "
         f"exact match rate {_format_rate(metrics['exact_match_rate'])}; "
-        f"comparable ratio {_format_rate(metrics['comparable_ratio'])}; "
+        f"comparable positions {metrics['comparable_positions_total']}; "
+        f"single-sided missing ratio {_format_rate(metrics['single_sided_missing_ratio'])}; "
         f"logprob coverage {_format_rate(metrics['logprob_coverage'])}; "
         f"max logprob delta {_format_delta(metrics['max_logprob_delta'])} "
         f"(allowed {report.max_logprob_delta}); "
@@ -867,6 +903,11 @@ def run_compare(args: argparse.Namespace) -> int:
         print(f"failures: {len(report.failures)}")
         for failure in report.failures:
             print(f"  - {failure}")
+    bad = [diff for diff in report.diffs if diff.verdict != VERDICT_PASS]
+    if bad:
+        print(f"records not passing: {len(bad)}")
+        for diff in bad:
+            print(f"  - {diff.verdict} {diff.record_id}: {diff.verdict_reason}")
     print(f"report: {out_path}")
     print(f"verdict: {report.verdict}")
     return VERDICT_EXIT_CODES[report.verdict]
@@ -1102,12 +1143,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     compare.add_argument(
-        "--min-comparable-ratio",
-        type=float,
-        default=DEFAULT_MIN_COMPARABLE_RATIO,
+        "--min-comparable-positions",
+        type=int,
+        default=DEFAULT_MIN_COMPARABLE_POSITIONS,
         help=(
-            "records below this share of comparable (token-equal) positions are inconclusive "
-            f"(default: {DEFAULT_MIN_COMPARABLE_RATIO})"
+            "records with fewer token-equal (comparable) positions than this are inconclusive; "
+            "a single agreeing position is not evidence "
+            f"(default: {DEFAULT_MIN_COMPARABLE_POSITIONS})"
+        ),
+    )
+    compare.add_argument(
+        "--max-single-sided-missing-ratio",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SIDED_MISSING_RATIO,
+        help=(
+            "records whose comparable positions lack a logprob on exactly one side at a higher share "
+            f"fail (default: {DEFAULT_MAX_SINGLE_SIDED_MISSING_RATIO})"
         ),
     )
     compare.add_argument(

@@ -45,7 +45,21 @@ def write_pair(tmp_path: Path, records_a: list[dict], records_b: list[dict]) -> 
 
 def run_compare(tmp_path: Path, path_a: Path, path_b: Path, *extra: str) -> tuple[int, str]:
     out = tmp_path / "report.md"
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), *extra])
+    # Legacy fixtures are tiny; the 16-position default is exercised by its own tests.
+    code = compare_tool.main(
+        [
+            "compare",
+            "--a",
+            str(path_a),
+            "--b",
+            str(path_b),
+            "--out",
+            str(out),
+            "--min-comparable-positions",
+            "0",
+            *extra,
+        ]
+    )
     report = out.read_text(encoding="utf-8") if out.exists() else ""
     return code, report
 
@@ -71,7 +85,7 @@ def test_summary_metrics_for_identical_runs(tmp_path: Path):
         [make_record("p1", ["a", "b"], backend="mrv2")],
     )
 
-    report = compare_tool.compare_files(path_a, path_b)
+    report = compare_tool.compare_files(path_a, path_b, thresholds=compare_tool.Thresholds(min_comparable_positions=0))
     metrics = compare_tool.summarize(report)
 
     assert report.passed is True
@@ -115,7 +129,7 @@ def test_logprob_delta_over_threshold_fails(tmp_path: Path):
 
     assert code == compare_tool.EXIT_MISMATCH
     assert "logprob delta 0.300000 at position 1 exceeds" in report
-    assert "| `p1` | yes | 2/2 | 100.00% | 2/2 (100.00%) | 2/2 (100.00%) | 0 | 0.300000 | yes | FAIL |" in report
+    assert "| `p1` | yes | 2/2 | 100.00% | 2 pos (100.00% of 2) | 2/2 (100.00%) | 0 | 0.300000 | yes | FAIL |" in report
     assert "## Verdict: FAIL" in report
 
 
@@ -195,7 +209,9 @@ def test_unknown_report_suffix_is_input_error(tmp_path: Path, capsys: pytest.Cap
     path_a, path_b = write_pair(tmp_path, [make_record("p1", ["a"])], [make_record("p1", ["a"], backend="mrv2")])
     out = tmp_path / "report.txt"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "0"]
+    )
 
     assert code == compare_tool.EXIT_INPUT_ERROR
     assert "must end with one of" in capsys.readouterr().err
@@ -291,7 +307,9 @@ def test_json_report_shape(tmp_path: Path):
     path_a, path_b = write_pair(tmp_path, records_a, records_b)
     out = tmp_path / "report.json"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "0"]
+    )
 
     assert code == compare_tool.EXIT_OK
     payload = json.loads(out.read_text(encoding="utf-8"))
@@ -516,6 +534,8 @@ def test_incomparable_positions_reach_the_json_report(tmp_path: Path):
             str(out),
             "--min-exact-match-rate",
             "0.4",
+            "--min-comparable-positions",
+            "0",
         ]
     )
 
@@ -638,28 +658,31 @@ def test_both_sides_missing_logprobs_is_inconclusive(tmp_path: Path):
     assert "both missing 2, one side missing 0" in report
 
 
-def test_one_side_missing_logprobs_is_inconclusive(tmp_path: Path):
+def test_one_side_missing_logprobs_fails(tmp_path: Path):
     tokens = ["a", "b"]
     records_a = [make_record("p1", tokens, [-0.1, -0.2], backend="mrv1")]
     records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
 
     code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
 
+    # Asymmetric evidence: one leg carries logprobs, the other does not.
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "single-sided missing logprobs 2/2 (100.00%) exceed" in report
+    assert "--max-single-sided-missing-ratio 0.00%" in report
+    assert "## Verdict: FAIL" in report
+
+
+def test_too_few_comparable_positions_is_inconclusive(tmp_path: Path):
+    tokens = ["a", "b", "c"]
+    records_a = [make_record("p1", tokens, backend="mrv1")]
+    records_b = [make_record("p1", tokens, backend="mrv2")]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
     assert code == compare_tool.EXIT_INPUT_ERROR
-    assert "both missing 0, one side missing 2" in report
-    assert "## Verdict: INCONCLUSIVE" in report
-
-
-def test_comparable_ratio_below_threshold_is_inconclusive(tmp_path: Path):
-    records_a = [make_record("g1", ["a", "x", "y"], backend="mrv1", temperature=0.0)]
-    records_b = [make_record("g1", ["a", "p", "q"], backend="mrv2", temperature=0.0)]
-
-    # Greedy exactness is disabled on purpose: the comparable-ratio rule must
-    # catch the record even though greedy divergence would otherwise fail it.
-    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--no-greedy-require-exact")
-
-    assert code == compare_tool.EXIT_INPUT_ERROR
-    assert "evidence insufficient: only 1/3 comparable position(s)" in report
+    assert "evidence insufficient: only 3 comparable position(s), --min-comparable-positions is 16" in report
     assert "## Verdict: INCONCLUSIVE" in report
 
 
@@ -672,7 +695,7 @@ def test_exact_rate_at_the_threshold_passes(tmp_path: Path):
     code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
 
     assert code == compare_tool.EXIT_OK
-    assert "| 90.00% | 9/10 (90.00%) |" in report
+    assert "| 90.00% | 9 pos (90.00% of 10) |" in report
     assert "## Verdict: PASS" in report
 
 
@@ -742,19 +765,23 @@ def test_thresholds_are_echoed_in_markdown(tmp_path: Path):
         *write_pair(tmp_path, records_a, records_b),
         "--min-exact-match-rate",
         "0.5",
-        "--min-comparable-ratio",
-        "0.4",
+        "--min-comparable-positions",
+        "2",
         "--min-logprob-coverage",
         "0.6",
+        "--max-single-sided-missing-ratio",
+        "0.1",
     )
 
     assert code == compare_tool.EXIT_OK
     assert "- min exact match rate (non-greedy): 0.5" in report
-    assert "- min comparable ratio: 0.4" in report
+    assert "- min comparable positions: 2" in report
     assert "- min logprob coverage: 0.6" in report
+    assert "- max single-sided missing ratio: 0.1" in report
     assert "| min exact match rate (non-greedy) | 50.00% |" in report
-    assert "| min comparable ratio | 40.00% |" in report
+    assert "| min comparable positions | 2 |" in report
     assert "| min logprob coverage | 60.00% |" in report
+    assert "| max single-sided missing ratio | 10.00% |" in report
 
 
 def test_thresholds_are_echoed_in_json(tmp_path: Path):
@@ -763,25 +790,30 @@ def test_thresholds_are_echoed_in_json(tmp_path: Path):
     path_a, path_b = write_pair(tmp_path, records_a, records_b)
     out = tmp_path / "report.json"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "0"]
+    )
 
     assert code == compare_tool.EXIT_OK
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["verdict"] == "PASS"
     assert payload["thresholds"] == {
         "min_exact_match_rate": 0.90,
-        "min_comparable_ratio": 0.50,
+        "min_comparable_positions": 0,
         "min_logprob_coverage": 0.90,
+        "max_single_sided_missing_ratio": 0.0,
     }
     assert payload["metrics"]["thresholds"] == payload["thresholds"]
     assert payload["metrics"]["exact_match_rate"] == 1.0
-    assert payload["metrics"]["comparable_ratio"] == 1.0
+    assert payload["metrics"]["comparable_positions_total"] == 2
+    assert payload["metrics"]["single_sided_missing_ratio"] == 0.0
     assert payload["metrics"]["logprob_coverage"] == 1.0
     assert payload["metrics"]["inconclusive_records"] == []
     assert payload["metrics"]["records_passed"] == 1
     assert payload["records"][0]["verdict"] == "PASS"
     assert payload["records"][0]["exact_rate"] == 1.0
     assert payload["records"][0]["comparable_positions"] == 2
+    assert payload["records"][0]["single_sided_missing_ratio"] == 0.0
 
 
 def test_inconclusive_json_metrics(tmp_path: Path):
@@ -791,7 +823,9 @@ def test_inconclusive_json_metrics(tmp_path: Path):
     path_a, path_b = write_pair(tmp_path, records_a, records_b)
     out = tmp_path / "report.json"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "0"]
+    )
 
     assert code == compare_tool.EXIT_INPUT_ERROR
     payload = json.loads(out.read_text(encoding="utf-8"))
@@ -804,17 +838,12 @@ def test_inconclusive_json_metrics(tmp_path: Path):
     assert "evidence insufficient" in payload["records"][0]["verdict_reason"]
 
 
-def test_comparable_ratio_threshold_can_be_lowered(tmp_path: Path):
-    records_a = [make_record("g1", ["a", "x", "y"], backend="mrv1", temperature=0.0)]
-    records_b = [make_record("g1", ["a", "p", "q"], backend="mrv2", temperature=0.0)]
+def test_min_comparable_positions_can_be_lowered(tmp_path: Path):
+    tokens = ["a", "b", "c"]
+    records_a = [make_record("p1", tokens, backend="mrv1")]
+    records_b = [make_record("p1", tokens, backend="mrv2")]
 
-    code, report = run_compare(
-        tmp_path,
-        *write_pair(tmp_path, records_a, records_b),
-        "--no-greedy-require-exact",
-        "--min-comparable-ratio",
-        "0.3",
-    )
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "3")
 
     assert code == compare_tool.EXIT_OK
     assert "## Verdict: PASS" in report
@@ -836,8 +865,8 @@ def test_logprob_coverage_threshold_can_be_lowered(tmp_path: Path):
     [
         ("--min-exact-match-rate", "-0.1"),
         ("--min-exact-match-rate", "1.5"),
-        ("--min-comparable-ratio", "-0.1"),
-        ("--min-comparable-ratio", "1.5"),
+        ("--max-single-sided-missing-ratio", "-0.1"),
+        ("--max-single-sided-missing-ratio", "1.5"),
         ("--min-logprob-coverage", "-0.1"),
         ("--min-logprob-coverage", "1.5"),
     ],
@@ -862,8 +891,109 @@ def test_stdout_last_line_is_the_verdict(tmp_path: Path, capsys: pytest.CaptureF
     path_a, path_b = write_pair(tmp_path, records_a, records_b)
     out = tmp_path / "report.md"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "0"]
+    )
 
     assert code == compare_tool.EXIT_INPUT_ERROR
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert lines[-1] == "verdict: INCONCLUSIVE"
+
+
+def test_single_sided_missing_one_of_a_thousand_fails(tmp_path: Path):
+    """D1: one asymmetric leg is enough to reject the record, however large the sample."""
+    tokens = [f"t{index}" for index in range(1000)]
+    logprobs_a = [-0.1] * 1000
+    logprobs_b = [-0.1] * 1000
+    logprobs_b[0] = None
+    records_a = [make_record("p1", tokens, logprobs_a, backend="mrv1")]
+    records_b = [make_record("p1", tokens, logprobs_b, backend="mrv2")]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "single-sided missing logprobs 1/1000 (0.10%) exceed" in report
+    assert "--max-single-sided-missing-ratio 0.00%" in report
+    assert "## Verdict: FAIL" in report
+
+
+def test_both_sides_missing_ten_percent_is_inconclusive(tmp_path: Path):
+    """D1/D2: 10% both-missing evidence leaves coverage below 0.90 for a real sample."""
+    tokens_a = ["A", "B"] + [f"t{index}" for index in range(18)]
+    tokens_b = ["X", "Y"] + list(tokens_a[2:])
+    logprobs_a = [-0.1] * 20
+    logprobs_b = [-0.1] * 20
+    for position in (2, 3):
+        logprobs_a[position] = None
+        logprobs_b[position] = None
+    records_a = [make_record("p1", tokens_a, logprobs_a, backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", tokens_b, logprobs_b, backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "logprob coverage 16/18 (88.89%)" in report
+    assert "## Verdict: INCONCLUSIVE" in report
+
+
+def test_both_sides_missing_one_percent_can_pass(tmp_path: Path):
+    tokens = [f"t{index}" for index in range(100)]
+    logprobs_a = [-0.1] * 100
+    logprobs_b = [-0.1] * 100
+    logprobs_a[0] = None
+    logprobs_b[0] = None
+    records_a = [make_record("p1", tokens, logprobs_a, backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", tokens, logprobs_b, backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
+    assert code == compare_tool.EXIT_OK
+    assert "| logprob coverage (all records) | 99.00% |" in report
+    assert "## Verdict: PASS" in report
+
+
+def test_fifteen_comparable_positions_are_inconclusive(tmp_path: Path):
+    """D2: a tiny but perfectly agreeing sample is not evidence."""
+    tokens = [f"t{index}" for index in range(15)]
+    records_a = [make_record("p1", tokens, backend="mrv1")]
+    records_b = [make_record("p1", tokens, backend="mrv2")]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "only 15 comparable position(s), --min-comparable-positions is 16" in report
+    assert "## Verdict: INCONCLUSIVE" in report
+
+
+def test_sixteen_comparable_positions_pass(tmp_path: Path):
+    tokens = [f"t{index}" for index in range(16)]
+    records_a = [make_record("p1", tokens, backend="mrv1")]
+    records_b = [make_record("p1", tokens, backend="mrv2")]
+
+    code, report = run_compare(
+        tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-comparable-positions", "16"
+    )
+
+    assert code == compare_tool.EXIT_OK
+    assert "## Verdict: PASS" in report
+
+
+def test_negative_min_comparable_positions_is_input_error(tmp_path: Path, capsys: pytest.CaptureFixture):
+    path_a, path_b = write_pair(tmp_path, [make_record("p1", ["a"])], [make_record("p1", ["a"], backend="mrv2")])
+    out = tmp_path / "report.md"
+
+    code = compare_tool.main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), "--min-comparable-positions", "-1"]
+    )
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "must not be negative" in capsys.readouterr().err
+    assert not out.exists()

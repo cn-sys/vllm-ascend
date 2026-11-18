@@ -64,6 +64,7 @@ if sys.path and os.path.abspath(sys.path[0] or ".") == _SCRIPT_DIR:
 
 import argparse
 import atexit
+import contextlib
 import hashlib
 import json
 import shlex
@@ -110,15 +111,45 @@ COMPARE_TOOL = TOOLS_DIR / "mrv1_mrv2_compare.py"
 DEFAULT_REQUESTS = TOOLS_DIR / "mrv1_mrv2_prompts.jsonl"
 RELEASE_TAG_FILE = ".github/vllm-release-tag.commit"
 DEFAULT_PORT_BASE = 8000
-DEFAULT_READINESS_TIMEOUT = 900.0
+DEFAULT_READINESS_TIMEOUT = 1800.0
+CHILD_ENV_KEYS = (
+    RUNNER_ENV,
+    "SERVER_PORT",
+    "ASCEND_RT_VISIBLE_DEVICES",
+    "VLLM_ENGINE_READY_TIMEOUT_S",
+    "VLLM_USE_MODELSCOPE",
+    "HCCL_OP_EXPANSION_MODE",
+    "OMP_NUM_THREADS",
+)
+IDENTITY_FIELDS = ("image_tag", "cann_version", "torch_npu_version", "model_revision", "hardware", "graph_mode")
+STUB_WARNING = "stub rehearsal output, not real measurement"
+SIGNAL_ABORT_REASON: str | None = None
+COMPARE_VERDICTS = {EXIT_OK: "pass", EXIT_MISMATCH: "fail", EXIT_INPUT_ERROR: "inconclusive"}
 DEFAULT_COLLECT_TIMEOUT = 3600.0
 DEFAULT_STOP_GRACE = 10.0
 DEFAULT_HEALTH_URL = "http://127.0.0.1:${PORT}/health"
 DEFAULT_BASE_URL = "http://127.0.0.1:${PORT}"
 DEFAULT_SERVE_COMMAND = "{python} {tool} _stub-server --port ${PORT} --backend ${BACKEND} --log-mode ${STUB_LOG_MODE}"
 STUB_LOG_MODES = ("explicit", "unset", "fallback", "both")
-STUB_PROMPT_TOKENS = ("stub", "token", "one", "two")
-STUB_PROMPT_LOGPROBS = (-0.1, -0.2, -0.3, -0.4)
+STUB_PROMPT_TOKENS = (
+    "stub",
+    "token",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+)
+STUB_PROMPT_LOGPROBS = tuple(-0.1 * (index + 1) for index in range(len(STUB_PROMPT_TOKENS)))
 HEALTH_POLL_SECONDS = 0.2
 RESERVED_VARIABLES = (RUNNER_ENV, "SERVER_PORT", "PORT", "BACKEND", "CONFIG")
 LIVE_PROCESSES: set[Any] = set()
@@ -138,14 +169,39 @@ class Aborted(RuntimeError):
     """A run step failed and the run must stop without collecting any data."""
 
 
+class SignalAbort(RuntimeError):
+    """A termination signal arrived; child process groups were killed and the run aborts."""
+
+
 def fail(message: str, code: int = EXIT_INPUT_ERROR) -> int:
     """Print one error on stderr and return the exit code that carries it."""
     print(f"error: {message}", file=sys.stderr)
     return code
 
 
+def _process_group_available() -> bool:
+    """Whether this host can signal a whole process group."""
+    return hasattr(os, "killpg") and hasattr(os, "getpgid")
+
+
+def terminate_process_groups() -> None:
+    """SIGTERM every live server process group; used by the signal handler and atexit."""
+    for process in list(LIVE_PROCESSES):
+        try:
+            if process.poll() is not None:
+                continue
+            if _process_group_available():
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, AttributeError):
+            with contextlib.suppress(OSError):
+                process.terminate()
+
+
 def cleanup_live_processes() -> None:
     """Kill every server this process still owns; registered with atexit."""
+    terminate_process_groups()
     for process in list(LIVE_PROCESSES):
         try:
             if process.poll() is None:
@@ -154,6 +210,30 @@ def cleanup_live_processes() -> None:
         except (OSError, subprocess.TimeoutExpired):
             pass
         LIVE_PROCESSES.discard(process)
+
+
+def handle_termination(signum: int, frame: Any) -> None:
+    """Signal handler: kill the child process groups, remember why, abort the run."""
+    global SIGNAL_ABORT_REASON
+    signame = signal.Signals(signum).name if signum in signal.valid_signals() else str(signum)
+    SIGNAL_ABORT_REASON = f"terminated by {signame}"
+    terminate_process_groups()
+    raise SignalAbort(SIGNAL_ABORT_REASON)
+
+
+def install_signal_handlers() -> list[str]:
+    """Install SIGTERM/SIGINT/SIGHUP handlers; returns the names that were installed."""
+    installed: list[str] = []
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, handle_termination)
+        except (OSError, ValueError):
+            continue
+        installed.append(name)
+    return installed
 
 
 atexit.register(cleanup_live_processes)
@@ -185,12 +265,19 @@ class Options:
     health_url: str
     base_url: str
     port_base: int
-    readiness_timeout: float
+    readiness_timeout: float | None
     collect_timeout: float
     stop_grace: float
     variables: dict[str, str]
     dry_run: bool
     allow_single_command: bool
+    reuse_dir: bool
+    image_tag: str | None = None
+    cann_version: str | None = None
+    torch_npu_version: str | None = None
+    model_revision: str | None = None
+    hardware: str | None = None
+    graph_mode: str | None = None
 
 
 @dataclass
@@ -212,6 +299,8 @@ class ConfigPlan:
     is_pd: bool = False
     single_command_override: bool = False
     blocked_reason: str | None = None
+    run_mode: str = "real"
+    engine_ready_timeout: float | None = None
 
 
 @dataclass
@@ -235,6 +324,10 @@ class BackendRun:
     missing_placeholders: list[dict[str, Any]] = field(default_factory=list)
     unresolved_variables: list[dict[str, Any]] = field(default_factory=list)
     resolved_from_environ: list[str] = field(default_factory=list)
+    serve_command: str | None = None
+    child_env_subset: dict[str, str] = field(default_factory=dict)
+    readiness_timeout: float | None = None
+    readiness_source: str | None = None
 
 
 class Executor:
@@ -259,7 +352,7 @@ class Executor:
                 env=env,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
-                start_new_session=os.name != "nt",
+                start_new_session=True,
             )
         LIVE_PROCESSES.add(process)
         return Launch(process, log_path)
@@ -272,7 +365,10 @@ class Executor:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
             else:
                 try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    if _process_group_available():
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    else:
+                        process.terminate()
                 except OSError:
                     process.terminate()
             try:
@@ -282,7 +378,10 @@ class Executor:
                     process.kill()
                 else:
                     try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        if _process_group_available():
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        else:
+                            process.kill()
                     except OSError:
                         process.kill()
                 process.wait(timeout=grace)
@@ -348,6 +447,18 @@ def mapping_entries(lines: list[str], key_index: int, key_indent: int, depth: in
         if value is not None:
             entries[key.strip()] = value
     return entries
+
+
+def env_float(env: dict[str, str], name: str) -> float | None:
+    """Read a positive float from a config env mapping; unusable values are ignored."""
+    raw = env.get(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def config_env(text: str) -> dict[str, str]:
@@ -643,6 +754,24 @@ def collect_command(plan: ConfigPlan, options: Options, run: BackendRun, base_ur
     ]
 
 
+def effective_readiness_timeout(plan: ConfigPlan, options: Options) -> tuple[float, str]:
+    """Resolve the readiness budget: the config value wins unless the CLI asks for more.
+
+    The config's VLLM_ENGINE_READY_TIMEOUT_S describes the model load budget, so
+    the default 1800 s is only a fallback; an explicit --readiness-timeout may
+    enlarge it but never silently shorten what the config asked for.
+    """
+    config_value = plan.engine_ready_timeout
+    cli_value = options.readiness_timeout
+    if cli_value is None:
+        if config_value is not None:
+            return config_value, "config"
+        return DEFAULT_READINESS_TIMEOUT, "default"
+    if config_value is not None and config_value > cli_value:
+        return config_value, "config"
+    return cli_value, "cli"
+
+
 def execute_backend(
     plan: ConfigPlan, run: BackendRun, options: Options, executor: Executor, records: list[dict[str, Any]]
 ) -> None:
@@ -688,6 +817,9 @@ def execute_backend(
     overrides["SERVER_PORT"] = str(run.port)
     run.env_overrides = overrides
     run.resolved_from_environ = sorted(resolver.resolved_from_environ)
+    run.readiness_timeout, run.readiness_source = effective_readiness_timeout(plan, options)
+    run.serve_command = rendered
+    run.child_env_subset = {key: overrides[key] for key in CHILD_ENV_KEYS if key in overrides}
     run.log_path = plan.data_dir / run.backend / "server.log"
     run.collect_path = plan.data_dir / run.backend / "collect.jsonl"
     run.collect_argv = collect_command(plan, options, run, base_url)
@@ -704,7 +836,9 @@ def execute_backend(
     log_path = run.log_path
     try:
         launch = executor.launch(rendered, REPO_ROOT, env, log_path, run.port)
-        run.readiness_s = wait_for_health(health_url, launch.process, options.readiness_timeout)
+        run.readiness_s = wait_for_health(
+            health_url, launch.process, run.readiness_timeout or DEFAULT_READINESS_TIMEOUT
+        )
         gate_argv = [sys.executable, str(DUAL_TOOL), "verify-log", "--log", str(log_path), "--expect", run.backend]
         gate = executor.run(gate_argv, REPO_ROOT, env, 120)
         record_command(records, "verify-log", run.backend, gate_argv, REPO_ROOT, overrides, gate)
@@ -732,6 +866,23 @@ def count_records(path: Path | None) -> int | None:
     return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
+def prepare_data_dir(data_dir: Path, reuse: bool) -> tuple[bool, list[str]]:
+    """Refuse a non-empty data dir unless --reuse-dir; archive the previous comparison report."""
+    if not data_dir.exists():
+        return False, []
+    if not any(data_dir.iterdir()):
+        return False, []
+    if not reuse:
+        raise InputError(f"--data-dir {data_dir} already exists and is not empty; pass --reuse-dir to continue in it")
+    archived: list[str] = []
+    compare_md = data_dir / "compare.md"
+    if compare_md.is_file():
+        previous = data_dir / "compare.prev.md"
+        compare_md.replace(previous)
+        archived.append(str(previous))
+    return True, archived
+
+
 def build_manifest(
     plan: ConfigPlan,
     runs: dict[str, BackendRun],
@@ -739,6 +890,8 @@ def build_manifest(
     compare: dict[str, Any],
     abort_reason: str | None,
     options: Options,
+    archived_compare: list[str] | None = None,
+    reused_dir: bool = False,
 ) -> dict[str, Any]:
     """The manifest: the 14 plan fields, the per backend facts and the command log."""
     manifest: dict[str, Any] = {field: None for field in MANIFEST_FIELDS}
@@ -759,6 +912,10 @@ def build_manifest(
             "collect": str(run.collect_path) if run.collect_path else None,
             "gate_stdout": run.gate_stdout,
             "ignored_commands": run.ignored_commands,
+            "serve_command": run.serve_command,
+            "child_env_subset": run.child_env_subset,
+            "readiness_timeout": run.readiness_timeout,
+            "readiness_source": run.readiness_source,
         }
         for backend, run in runs.items()
     }
@@ -771,8 +928,21 @@ def build_manifest(
     manifest["dest"] = str(options.dest)
     manifest["abort_reason"] = abort_reason
     manifest["compare_exit"] = compare.get("exit")
+    manifest["compare_verdict"] = compare.get("verdict")
     manifest["compare_md"] = compare.get("md")
     manifest["compare_json"] = compare.get("json")
+    manifest["run_mode"] = plan.run_mode
+    manifest["warning"] = STUB_WARNING if plan.run_mode == "stub" else None
+    manifest["identity_source"] = (
+        "cli" if any(getattr(options, identity_field) for identity_field in IDENTITY_FIELDS) else "unset"
+    )
+    for identity_field in IDENTITY_FIELDS:
+        manifest[identity_field] = getattr(options, identity_field)
+    manifest["reused_dir"] = reused_dir
+    manifest["archived_compare"] = archived_compare or []
+    first_run = next(iter(runs.values()), None)
+    manifest["readiness_timeout"] = first_run.readiness_timeout if first_run else None
+    manifest["readiness_source"] = first_run.readiness_source if first_run else None
     return manifest
 
 
@@ -785,16 +955,24 @@ def run_compare(
     if not collect_a.is_file() or not collect_b.is_file():
         raise Aborted("compare requested but a collect file is missing")
     base = [sys.executable, str(COMPARE_TOOL), "compare", "--a", str(collect_a), "--b", str(collect_b)]
-    info: dict[str, Any] = {"exit": None, "md": None, "json": None}
+    info: dict[str, Any] = {"exit": None, "verdict": None, "md": None, "json": None}
     for suffix, path in (("md", plan.data_dir / "compare.md"), ("json", plan.data_dir / "compare.json")):
         argv = [*base, "--out", str(path)]
         result = executor.run(argv, REPO_ROOT, None, None)
         record_command(records, "compare", None, argv, REPO_ROOT, {}, result)
+        # Exit 0/1/2 are all verdicts the compare tool can legitimately reach;
+        # a regression (no report file) or any other code is a pipeline failure.
+        if result.returncode not in COMPARE_VERDICTS:
+            raise Aborted(f"compare crashed with {result.returncode}: {result.stderr.strip()}")
+        if not path.is_file():
+            raise Aborted(f"compare exited {result.returncode} but wrote no {path.name}: {result.stderr.strip()}")
         info[suffix] = str(path)
+        verdict = COMPARE_VERDICTS[result.returncode]
         if suffix == "md":
             info["exit"] = result.returncode
-        if result.returncode not in (EXIT_OK, EXIT_MISMATCH):
-            raise Aborted(f"compare failed with {result.returncode}: {result.stderr.strip()}")
+            info["verdict"] = verdict
+        elif info["verdict"] is not None and verdict != info["verdict"]:
+            raise Aborted(f"compare report formats disagree: md says {info['verdict']}, json says {verdict}")
     return info
 
 
@@ -815,6 +993,10 @@ def archive_dry_run(
         "unresolved_variables": unresolved,
         "resolved_from_environ": sorted({name for run in runs.values() for name in run.resolved_from_environ}),
         "plan_argv": [record["argv"] for record in records if record["stage"] == "plan"],
+        "run_mode": plan.run_mode,
+        "readiness_timeout": next(iter(runs.values())).readiness_timeout if runs else None,
+        "readiness_source": next(iter(runs.values())).readiness_source if runs else None,
+        "identity_source": "cli" if any(getattr(options, field) for field in IDENTITY_FIELDS) else "unset",
         "backends": [
             {
                 "backend": run.backend,
@@ -831,6 +1013,7 @@ def archive_dry_run(
                     run.backend,
                 ],
                 "collect_argv": run.collect_argv,
+                "child_env_subset": run.child_env_subset,
                 "server_log": str(run.log_path),
                 "collect": str(run.collect_path),
                 "ignored_commands": run.ignored_commands,
@@ -849,8 +1032,15 @@ def execute_config(
     """Run one config end to end; returns the process exit code."""
     runs: dict[str, BackendRun] = {}
     records = [] if records is None else records
-    compare: dict[str, Any] = {"exit": None, "md": None, "json": None}
+    compare: dict[str, Any] = {"exit": None, "verdict": None, "md": None, "json": None}
     abort_reason: str | None = None
+    reused_dir = False
+    archived_compare: list[str] = []
+    if not options.dry_run:
+        try:
+            reused_dir, archived_compare = prepare_data_dir(plan.data_dir, options.reuse_dir)
+        except InputError as exc:
+            return fail(str(exc))
     try:
         for backend in BACKENDS:
             run = BackendRun(backend=backend)
@@ -865,20 +1055,26 @@ def execute_config(
                 )
             return EXIT_OK
         compare = run_compare(plan, options, executor, records)
-    except (Aborted, InputError) as exc:
+    except (Aborted, InputError, SignalAbort) as exc:
         abort_reason = str(exc)
+        if isinstance(exc, SignalAbort) and SIGNAL_ABORT_REASON:
+            abort_reason = SIGNAL_ABORT_REASON
     if options.dry_run:
         return fail(abort_reason or "dry-run failed")
-    manifest = build_manifest(plan, runs, records, compare, abort_reason, options)
+    manifest = build_manifest(plan, runs, records, compare, abort_reason, options, archived_compare, reused_dir)
     manifest_path = plan.data_dir / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if abort_reason is not None:
         return fail(f"{plan.slug}: {abort_reason}")
     print(f"manifest: {manifest_path}")
-    if compare.get("exit") == EXIT_MISMATCH:
+    verdict = compare.get("verdict")
+    if verdict == "fail":
         print(f"compare reports a mismatch: {compare['md']}", file=sys.stderr)
         return EXIT_MISMATCH
+    if verdict == "inconclusive":
+        print(f"compare is INCONCLUSIVE (evidence insufficient): {compare['md']}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
     print(f"parity holds for {plan.slug}: {compare['md']}")
     return EXIT_OK
 
@@ -968,6 +1164,7 @@ def load_plans(
         if problem is not None:
             problems.append(problem)
         plan_data_dir = data_dir if total == 1 else data_dir / slug
+        engine_env = config_env(copies["mrv1"].read_text(encoding="utf-8"))
         plans.append(
             ConfigPlan(
                 slug=slug,
@@ -977,7 +1174,8 @@ def load_plans(
                 model=models.pop(),
                 commands=commands,
                 copies=copies,
-                env=config_env(copies["mrv1"].read_text(encoding="utf-8")),
+                env=engine_env,
+                engine_ready_timeout=env_float(engine_env, "VLLM_ENGINE_READY_TIMEOUT_S"),
                 command_count=command_count,
                 command_counts=command_counts,
                 carrier=entry.get("carrier"),
@@ -1013,6 +1211,13 @@ def rehearse_options(args: argparse.Namespace) -> Options:
         variables=variables,
         dry_run=False,
         allow_single_command=False,
+        reuse_dir=bool(args.reuse_dir),
+        image_tag=args.image_tag,
+        cann_version=args.cann_version,
+        torch_npu_version=args.torch_npu_version,
+        model_revision=args.model_revision,
+        hardware=args.hardware,
+        graph_mode=args.graph_mode,
     )
 
 
@@ -1032,6 +1237,7 @@ def run_rehearse(args: argparse.Namespace) -> int:
             commands={backend: serve_cmd for backend in BACKENDS},
             copies={backend: Path(".") for backend in BACKENDS},
             env={},
+            run_mode="stub",
         )
     except (InputError, OSError) as exc:
         return fail(str(exc))
@@ -1056,6 +1262,13 @@ def run_real(args: argparse.Namespace) -> int:
             variables=parse_variables(args.var),
             dry_run=bool(args.dry_run),
             allow_single_command=bool(args.allow_single_command),
+            reuse_dir=bool(args.reuse_dir),
+            image_tag=args.image_tag,
+            cann_version=args.cann_version,
+            torch_npu_version=args.torch_npu_version,
+            model_revision=args.model_revision,
+            hardware=args.hardware,
+            graph_mode=args.graph_mode,
         )
         records: list[dict[str, Any]] = []
         plans, problems = load_plans(slugs, Path(args.data_dir), options, Executor(), records)
@@ -1172,9 +1385,28 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--requests", default=str(DEFAULT_REQUESTS), help="prompt JSONL replayed by collect")
     parser.add_argument("--health-url", default=DEFAULT_HEALTH_URL, help="readiness URL, placeholders allowed")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="server root for collect, placeholders allowed")
-    parser.add_argument("--readiness-timeout", type=float, default=DEFAULT_READINESS_TIMEOUT)
+    parser.add_argument(
+        "--readiness-timeout",
+        type=float,
+        default=None,
+        help=(
+            "server readiness budget in seconds; default: the config VLLM_ENGINE_READY_TIMEOUT_S, "
+            f"else {DEFAULT_READINESS_TIMEOUT:g}; the larger of this and the config value wins"
+        ),
+    )
     parser.add_argument("--collect-timeout", type=float, default=DEFAULT_COLLECT_TIMEOUT)
+    parser.add_argument(
+        "--reuse-dir",
+        action="store_true",
+        help="continue in a non-empty --data-dir, archiving the old compare.md as compare.prev.md",
+    )
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE", help="placeholder value")
+    parser.add_argument("--image-tag", default=None, help="container image tag recorded in the manifest")
+    parser.add_argument("--cann-version", default=None, help="CANN version recorded in the manifest")
+    parser.add_argument("--torch-npu-version", default=None, help="torch_npu version recorded in the manifest")
+    parser.add_argument("--model-revision", default=None, help="model revision recorded in the manifest")
+    parser.add_argument("--hardware", default=None, help="hardware recorded in the manifest")
+    parser.add_argument("--graph-mode", default=None, help="graph mode recorded in the manifest")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1214,8 +1446,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse ``argv`` and dispatch to the selected subcommand."""
+    """Parse argv, install the termination handlers and dispatch to the subcommand."""
     args = build_parser().parse_args(argv)
+    install_signal_handlers()
     return args.handler(args)
 
 

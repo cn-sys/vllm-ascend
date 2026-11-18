@@ -89,11 +89,20 @@ class FakeExecutor(parity.Executor):
     """Records every call and answers with canned results; never spawns anything."""
 
     def __init__(
-        self, *, gate_rc: int = 0, collect_rc: int = 0, compare_rc: int = 0, log_text: str = "explicit\n"
+        self,
+        *,
+        gate_rc: int = 0,
+        collect_rc: int = 0,
+        compare_rc: int = 0,
+        log_text: str = "explicit\n",
+        compare_writes: bool = True,
+        compare_rcs: dict[str, int] | None = None,
     ) -> None:
         self.gate_rc = gate_rc
         self.collect_rc = collect_rc
         self.compare_rc = compare_rc
+        self.compare_writes = compare_writes
+        self.compare_rcs = compare_rcs or {}
         self.log_text = log_text
         self.calls: list[str] = []
         self.launches: list[tuple[str, int]] = []
@@ -121,9 +130,11 @@ class FakeExecutor(parity.Executor):
             return parity.CommandResult(self.collect_rc, "", "" if self.collect_rc == 0 else "collect error")
         if stage == "compare":
             out = Path(argv[argv.index("--out") + 1])
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text("report\n", encoding="utf-8")
-            return parity.CommandResult(self.compare_rc, "", "")
+            suffix = out.suffix.lstrip(".")
+            if self.compare_writes:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text("report\n", encoding="utf-8")
+            return parity.CommandResult(self.compare_rcs.get(suffix, self.compare_rc), "", "")
         return parity.CommandResult(0, "", "")
 
     def launch(self, rendered, cwd, env, log_path, port) -> parity.Launch:
@@ -152,6 +163,7 @@ def make_options(tmp_path: Path, *, dry_run: bool = False, variables: dict[str, 
         variables={} if variables is None else variables,
         dry_run=dry_run,
         allow_single_command=False,
+        reuse_dir=False,
     )
 
 
@@ -242,15 +254,35 @@ def test_compare_mismatch_is_a_result_and_exits_one(tmp_path, monkeypatch):
     assert parity.execute_config(plan, make_options(tmp_path), executor) == 1
     manifest = read_manifest(plan)
     assert manifest["compare_exit"] == 1
+    assert manifest["compare_verdict"] == "fail"
+    assert manifest["compare_json"] is not None
     assert manifest["abort_reason"] is None
 
 
-def test_compare_input_error_aborts(tmp_path, monkeypatch):
+def test_compare_inconclusive_is_a_result_not_a_pipeline_failure(tmp_path, monkeypatch):
     no_http(monkeypatch)
     plan = make_plan(tmp_path)
     executor = FakeExecutor(compare_rc=2)
     assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
-    assert "compare failed" in read_manifest(plan)["abort_reason"]
+    manifest = read_manifest(plan)
+    assert manifest["compare_exit"] == 2
+    assert manifest["compare_verdict"] == "inconclusive"
+    assert manifest["abort_reason"] is None
+    assert manifest["compare_md"] is not None
+    assert manifest["compare_json"] is not None
+    assert (plan.data_dir / "compare.json").is_file()
+
+
+def test_compare_crash_without_a_report_still_aborts(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(compare_rc=2, compare_writes=False)
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    manifest = read_manifest(plan)
+    assert "wrote no compare.md" in manifest["abort_reason"]
+    assert manifest["compare_verdict"] is None
+    assert manifest["compare_md"] is None
+    assert manifest["compare_json"] is None
 
 
 def test_manifest_carries_the_plan_fields_and_per_backend_facts(tmp_path, monkeypatch):
@@ -918,3 +950,135 @@ def test_manifest_records_the_variables_read_from_the_environment(tmp_path, monk
     plan = make_plan(tmp_path, command="vllm serve org/model --seed ${ONLY_ENV}")
     assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 0
     assert read_manifest(plan)["resolved_from_environ"] == ["ONLY_ENV"]
+
+
+def test_readiness_uses_the_config_timeout(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.engine_ready_timeout = 1830.0
+    options = replace(make_options(tmp_path), readiness_timeout=None)
+    assert parity.execute_config(plan, options, FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    assert manifest["readiness_timeout"] == 1830.0
+    assert manifest["readiness_source"] == "config"
+    assert manifest["backends"]["mrv1"]["readiness_timeout"] == 1830.0
+
+
+def test_cli_readiness_wins_only_when_larger(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.engine_ready_timeout = 1830.0
+    larger = replace(make_options(tmp_path), readiness_timeout=2400.0)
+    assert parity.execute_config(plan, larger, FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    assert manifest["readiness_timeout"] == 2400.0
+    assert manifest["readiness_source"] == "cli"
+
+    second = tmp_path / "second"
+    second.mkdir()
+    plan2 = make_plan(second)
+    plan2.engine_ready_timeout = 1830.0
+    smaller = replace(make_options(tmp_path), readiness_timeout=300.0)
+    assert parity.execute_config(plan2, smaller, FakeExecutor()) == 0
+    manifest2 = read_manifest(plan2)
+    assert manifest2["readiness_timeout"] == 1830.0
+    assert manifest2["readiness_source"] == "config"
+
+
+def test_default_readiness_is_1800_and_dry_run_echoes_it(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    options = replace(make_options(tmp_path, dry_run=True), readiness_timeout=None)
+    assert parity.execute_config(plan, options, FakeExecutor()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["readiness_timeout"] == 1800.0
+    assert payload["readiness_source"] == "default"
+    assert parity.DEFAULT_READINESS_TIMEOUT == 1800.0
+
+
+def test_non_empty_data_dir_without_reuse_exits_two(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.data_dir.mkdir(parents=True)
+    (plan.data_dir / "stale.txt").write_text("old\n", encoding="utf-8")
+    executor = FakeExecutor()
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    assert executor.launches == []
+    assert executor.calls == []
+    assert "pass --reuse-dir" in capsys.readouterr().err
+
+
+def test_reuse_dir_archives_the_previous_comparison(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.data_dir.mkdir(parents=True)
+    (plan.data_dir / "compare.md").write_text("old report\n", encoding="utf-8")
+    options = replace(make_options(tmp_path), reuse_dir=True)
+    assert parity.execute_config(plan, options, FakeExecutor()) == 0
+    previous = plan.data_dir / "compare.prev.md"
+    assert previous.read_text(encoding="utf-8") == "old report\n"
+    manifest = read_manifest(plan)
+    assert manifest["reused_dir"] is True
+    assert manifest["archived_compare"] == [str(previous)]
+
+
+def test_manifest_self_description(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    assert manifest["run_mode"] == "real"
+    assert manifest["warning"] is None
+    assert manifest["identity_source"] == "unset"
+    for identity_field in parity.IDENTITY_FIELDS:
+        assert manifest[identity_field] is None
+    backend = manifest["backends"]["mrv1"]
+    assert backend["serve_command"].startswith("vllm serve org/model")
+    assert set(backend["child_env_subset"]) <= set(parity.CHILD_ENV_KEYS)
+    assert backend["child_env_subset"][parity.RUNNER_ENV] == parity.BACKEND_VALUES["mrv1"]
+    assert "SERVER_PORT" in backend["child_env_subset"]
+    assert "HCCL_BUFFSIZE" not in backend["child_env_subset"]
+
+
+def test_manifest_records_cli_identity_and_stub_warning(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    plan.run_mode = "stub"
+    options = replace(make_options(tmp_path), image_tag="img:1", hardware="Atlas A2")
+    assert parity.execute_config(plan, options, FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    assert manifest["run_mode"] == "stub"
+    assert manifest["warning"] == parity.STUB_WARNING
+    assert manifest["identity_source"] == "cli"
+    assert manifest["image_tag"] == "img:1"
+    assert manifest["hardware"] == "Atlas A2"
+    assert manifest["torch_npu_version"] is None
+
+
+def test_install_signal_handlers_registers_available_signals():
+    import signal
+
+    original = {name: signal.getsignal(getattr(signal, name)) for name in ("SIGTERM", "SIGINT")}
+    try:
+        installed = parity.install_signal_handlers()
+        assert "SIGTERM" in installed
+        assert "SIGINT" in installed
+        assert signal.getsignal(signal.SIGTERM) is parity.handle_termination
+        assert signal.getsignal(signal.SIGINT) is parity.handle_termination
+    finally:
+        for name, handler in original.items():
+            signal.signal(getattr(signal, name), handler)
+
+
+def test_terminate_process_groups_uses_killpg(tmp_path, monkeypatch):
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(parity.os, "killpg", lambda pid, sig: calls.append((pid, sig)), raising=False)
+    monkeypatch.setattr(parity.os, "getpgid", lambda pid: 4242, raising=False)
+    process = FakeProcess()
+    process.pid = 123
+    parity.LIVE_PROCESSES.add(process)
+    try:
+        parity.terminate_process_groups()
+    finally:
+        parity.LIVE_PROCESSES.discard(process)
+    assert (4242, parity.signal.SIGTERM) in calls

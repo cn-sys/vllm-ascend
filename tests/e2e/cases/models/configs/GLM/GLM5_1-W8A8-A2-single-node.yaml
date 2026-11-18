@@ -18,6 +18,11 @@
 # Model runner:      env_common pins VLLM_USE_V2_MODEL_RUNNER: "1"; the MRV1/MRV2
 #                    dual-run planner flips it to "0" in the copied yaml.
 #
+# Perf: T4 tools collect the real numbers; the first A2x8 run fills in the
+# baseline and N4b restores the benchmarks section when the matrix is
+# registered. It is absent here on purpose: a null baseline plus
+# threshold: 0.97 makes tools/aisbench.py compute 0.97 * None -> TypeError.
+#
 # Full serve command (arguments below + runner prefix):
 #   vllm serve Eco-Tech/GLM-5.1-w8a8
 #     --host 0.0.0.0 --port $SERVER_PORT
@@ -90,30 +95,3 @@ test_cases:
       - '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,48,60,72]}'
       - --speculative-config
       - '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
-    benchmarks:
-      perf-warm:
-        case_type: performance
-        dataset_path: vllm-ascend/GSM8K-in3500-bs2800
-        request_conf: vllm_api_stream_chat
-        dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
-        num_prompts: 18
-        max_out_len: 1500
-        batch_size: 18
-        request_rate: 0
-        # No historical single-node baseline exists; null makes the single-node
-        # and multi-node task_passed() skip the comparison while the measured
-        # number is still recorded. TODO: fill in after the first A2x8 MTP run.
-        baseline: null
-        threshold: 0.97
-      perf:
-        case_type: performance
-        dataset_path: vllm-ascend/GSM8K-in3500-bs2800
-        request_conf: vllm_api_stream_chat
-        dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
-        num_prompts: 72
-        max_out_len: 1500
-        batch_size: 18
-        request_rate: 0
-        # Same reasoning as perf-warm: baseline is unknown for the single-node shape.
-        baseline: null
-        threshold: 0.97
