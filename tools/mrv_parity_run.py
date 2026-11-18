@@ -127,7 +127,7 @@ IDENTITY_FIELDS = ("image_tag", "cann_version", "torch_npu_version", "model_revi
 STUB_WARNING = "stub rehearsal output, not real measurement"
 SIGNAL_ABORT_REASON: str | None = None
 COMPARE_VERDICTS = {EXIT_OK: "pass", EXIT_MISMATCH: "fail", EXIT_INPUT_ERROR: "inconclusive"}
-REPORT_FRESHNESS_SLACK_NS = 2_000_000_000
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
 DEFAULT_COLLECT_TIMEOUT = 3600.0
 DEFAULT_STOP_GRACE = 10.0
 DEFAULT_HEALTH_URL = "http://127.0.0.1:${PORT}/health"
@@ -143,6 +143,10 @@ HEALTH_POLL_SECONDS = 0.2
 RESERVED_VARIABLES = (RUNNER_ENV, "SERVER_PORT", "PORT", "BACKEND", "CONFIG")
 LIVE_PROCESSES: set[Any] = set()
 LIVE_PORTS: set[int] = set()
+LIVE_GROUPS: dict[int, int] = {}
+SERVER_ROOTS: set[int] = set()
+SERVER_PGIDS: set[int] = set()
+MAX_STUB_TOKENS = len(STUB_PROMPT_TOKENS)
 EXAMPLES = """examples:
   python tools/mrv_parity_run.py rehearse --stub --data-dir /tmp/t4rehearse
   python tools/mrv_parity_run.py run --configs GLM-5.2-W8A8C8-MTP-A5-dual-nodes --dest /tmp/t4dest \
@@ -169,46 +173,185 @@ def fail(message: str, code: int = EXIT_INPUT_ERROR) -> int:
     return code
 
 
+def is_windows() -> bool:
+    """Platform switch kept as a function so tests can patch it without touching os.name."""
+    return os.name == "nt"
+
+
 def _process_group_available() -> bool:
     """Whether this host can signal a whole process group."""
     return hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 
-def kill_process_tree(process: Any) -> None:
-    """Kill the whole server tree: taskkill /T on Windows, the process group on POSIX."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
-        return
-    if _process_group_available():
-        with contextlib.suppress(OSError):
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            return
+def listening_pids(port: int) -> list[int]:
+    """PIDs in LISTEN state on a port; a missing query tool warns and yields []."""
+    if is_windows():
+        try:
+            result = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False)
+        except OSError as exc:
+            print(f"warning: cannot list listeners on port {port}: {exc}", file=sys.stderr)
+            return []
+        pids: set[int] = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 5 and fields[0] == "TCP" and fields[1].endswith(f":{port}") and fields[3] == "LISTENING":
+                with contextlib.suppress(ValueError):
+                    pids.add(int(fields[4]))
+        return sorted(pids)
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        print(
+            f"warning: lsof is unavailable; cannot attribute a listener on port {port}; leaving it alone",
+            file=sys.stderr,
+        )
+        return []
+    except OSError as exc:
+        print(f"warning: cannot list listeners on port {port}: {exc}", file=sys.stderr)
+        return []
+    pids = set()
+    for token in result.stdout.split():
+        with contextlib.suppress(ValueError):
+            pids.add(int(token))
+    return sorted(pids)
+
+
+def _windows_parent_map() -> dict[int, int] | None:
+    """PID -> parent PID for the whole host, or None when the query is unavailable."""
+    script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    items = [payload] if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return None
+    parents: dict[int, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        with contextlib.suppress(KeyError, TypeError, ValueError):
+            parents[int(item["ProcessId"])] = int(item["ParentProcessId"])
+    return parents
+
+
+def pid_owned_by_server(pid: int) -> bool:
+    """True only for a pid inside a server tree launched by this process.
+
+    The executor's own pid/pgid and the collect clients are never owned by a
+    server tree, so a foreign listener is never killed.
+    """
+    if pid == os.getpid():
+        return False
+    if is_windows():
+        parents = _windows_parent_map()
+        if not parents:
+            return False
+        current = pid
+        for _ in range(64):
+            if current in SERVER_ROOTS:
+                return True
+            if not current:
+                return False
+            current = parents.get(current, 0)
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return False
     with contextlib.suppress(OSError):
-        process.terminate()
+        if pgid == os.getpgid(0):
+            return False
+    return pgid in SERVER_PGIDS or pid in SERVER_ROOTS
 
 
-def kill_port_owners(port: int) -> None:
-    """Kill whatever still listens on our port; the fallback when the shell tree is already gone."""
-    if not port_is_open(port):
-        return
-    for pid in port_owner_pids(port):
-        if os.name == "nt":
+def owned_listeners(port: int) -> tuple[list[int], list[int]]:
+    """Split the listeners on a port into this run's server tree and everything else."""
+    owned: list[int] = []
+    external: list[int] = []
+    for pid in listening_pids(port):
+        if pid_owned_by_server(pid):
+            owned.append(pid)
+        else:
+            external.append(pid)
+    return owned, external
+
+
+def kill_port_owners(port: int) -> bool:
+    """Kill only owned listeners left on our port; foreign listeners get a warning."""
+    owned, external = owned_listeners(port)
+    if external:
+        print(
+            f"warning: port {port} is held by process(es) {external} outside this run's server tree; "
+            "leaving them alone",
+            file=sys.stderr,
+        )
+    if not owned:
+        return False
+    for pid in owned:
+        if is_windows():
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
         else:
             with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGTERM)
+    if not is_windows():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and listening_pids(port):
+            time.sleep(0.05)
+        for pid in owned:
+            with contextlib.suppress(OSError):
+                os.kill(pid, FORCE_KILL_SIGNAL)
+    return True
 
 
-def terminate_process_groups() -> None:
-    """Kill every live server process group; used by the signal handler and atexit."""
+def terminate_process_groups(grace: float = DEFAULT_STOP_GRACE) -> None:
+    """SIGTERM the server groups, wait grace, then SIGKILL survivors; used by the handler and atexit."""
     for process in list(LIVE_PROCESSES):
         try:
             if process.poll() is not None:
                 continue
-            kill_process_tree(process)
+            if is_windows():
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+            else:
+                pgid = LIVE_GROUPS.get(process.pid)
+                if pgid is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(pgid, signal.SIGTERM)
+                else:
+                    with contextlib.suppress(OSError):
+                        process.terminate()
         except (OSError, AttributeError):
             with contextlib.suppress(OSError):
                 process.terminate()
+    deadline = time.monotonic() + max(0.0, grace)
+    while time.monotonic() < deadline and any(p.poll() is None for p in LIVE_PROCESSES):
+        time.sleep(0.1)
+    for process in list(LIVE_PROCESSES):
+        if process.poll() is not None:
+            continue
+        if is_windows():
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+        else:
+            pgid = LIVE_GROUPS.get(process.pid)
+            if pgid is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(pgid, FORCE_KILL_SIGNAL)
+            else:
+                with contextlib.suppress(OSError):
+                    process.kill()
     for port in list(LIVE_PORTS):
         with contextlib.suppress(OSError):
             kill_port_owners(port)
@@ -216,7 +359,7 @@ def terminate_process_groups() -> None:
 
 def cleanup_live_processes() -> None:
     """Kill every server this process still owns; registered with atexit."""
-    terminate_process_groups()
+    terminate_process_groups(grace=1.0)
     for process in list(LIVE_PROCESSES):
         try:
             if process.poll() is None:
@@ -228,7 +371,7 @@ def cleanup_live_processes() -> None:
 
 
 def handle_termination(signum: int, frame: Any) -> None:
-    """Signal handler: kill the child process groups, remember why, abort the run."""
+    """Signal handler: signal the child groups, wait their grace, then kill survivors."""
     global SIGNAL_ABORT_REASON
     signame = signal.Signals(signum).name if signum in signal.valid_signals() else str(signum)
     SIGNAL_ABORT_REASON = f"terminated by {signame}"
@@ -372,20 +515,28 @@ class Executor:
             )
         LIVE_PROCESSES.add(process)
         LIVE_PORTS.add(port)
+        pgid: int | None = None
+        if _process_group_available():
+            with contextlib.suppress(OSError):
+                pgid = os.getpgid(process.pid)
+        SERVER_ROOTS.add(process.pid)
+        if pgid is not None:
+            SERVER_PGIDS.add(pgid)
+            LIVE_GROUPS[process.pid] = pgid
         return Launch(process, log_path, port)
 
     def stop(self, launch: Launch, grace: float) -> int | None:
         """Stop a server tree: taskkill /T on Windows, SIGTERM to the POSIX group, then reap."""
         process = launch.process
-        if os.name == "nt":
-            # Always taskkill: the shell may already be reaped while its grandchildren (the
-            # real server) are still alive, and taskkill /T on the pid is the Windows way to
-            # reach them.
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+        pgid = LIVE_GROUPS.get(process.pid)
+        if is_windows():
+            # A reaped pid may already belong to another process: never taskkill it.
+            if process.poll() is None:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
         elif process.poll() is None:
             try:
-                if _process_group_available():
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGTERM)
                 else:
                     process.terminate()
             except OSError:
@@ -394,21 +545,24 @@ class Executor:
             try:
                 process.wait(timeout=grace)
             except subprocess.TimeoutExpired:
-                if os.name == "nt":
+                if is_windows():
                     process.kill()
+                elif pgid is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(pgid, FORCE_KILL_SIGNAL)
                 else:
-                    try:
-                        if _process_group_available():
-                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                        else:
-                            process.kill()
-                    except OSError:
+                    with contextlib.suppress(OSError):
                         process.kill()
-                process.wait(timeout=grace)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=grace)
         if launch.port is not None:
             kill_port_owners(launch.port)
             LIVE_PORTS.discard(launch.port)
         LIVE_PROCESSES.discard(process)
+        SERVER_ROOTS.discard(process.pid)
+        if pgid is not None:
+            SERVER_PGIDS.discard(pgid)
+            LIVE_GROUPS.pop(process.pid, None)
         return process.returncode
 
 
@@ -889,12 +1043,21 @@ def count_records(path: Path | None) -> int | None:
     return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
+def validate_data_dir(data_dir: Path) -> None:
+    """Refuse a --data-dir that exists as a regular file, before anything mkdirs it."""
+    if data_dir.exists() and data_dir.is_file():
+        raise InputError(f"--data-dir {data_dir} is a regular file, not a directory")
+
+
 def prepare_data_dir(data_dir: Path, reuse: bool) -> tuple[bool, list[str]]:
-    """Refuse a non-empty data dir unless --reuse-dir; archive the previous comparison report."""
+    """Refuse a non-empty data dir unless --reuse-dir, and move old comparison reports out.
+
+    The old reports are archived (reuse) or must not exist (fresh dir), so compare
+    can rely on a report being newly written instead of guessing from its mtime.
+    """
+    validate_data_dir(data_dir)
     if not data_dir.exists():
         return False, []
-    if data_dir.is_file():
-        raise InputError(f"--data-dir {data_dir} is a regular file, not a directory")
     if not any(data_dir.iterdir()):
         return False, []
     if not reuse:
@@ -906,42 +1069,35 @@ def prepare_data_dir(data_dir: Path, reuse: bool) -> tuple[bool, list[str]]:
             previous = data_dir / previous_name
             report.replace(previous)
             archived.append(str(previous))
+    for name in ("compare.md", "compare.json"):
+        leftover = data_dir / name
+        if leftover.exists():
+            leftover.unlink()
     return True, archived
 
 
-def port_owner_pids(port: int) -> list[int]:
-    """Best-effort PIDs listening on a port; only used for the residual-server report."""
-    if os.name == "nt":
-        result = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False)
-        pids: set[int] = set()
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) >= 5 and fields[0] == "TCP" and fields[1].endswith(f":{port}") and fields[3] == "LISTENING":
-                with contextlib.suppress(ValueError):
-                    pids.add(int(fields[4]))
-        return sorted(pids)
-    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, check=False)
-    pids = set()
-    for token in result.stdout.split():
-        with contextlib.suppress(ValueError):
-            pids.add(int(token))
-    return sorted(pids)
-
-
 def report_residual_servers(ports: list[int]) -> bool:
-    """Print every port still listening after a run; False means a server leaked."""
+    """Report listeners left on our ports; False only for owned (server tree) leftovers.
+
+    A foreign listener on the same port is only a warning: it belongs to another
+    process and must not change this run's exit code.
+    """
     leaked = False
     for port in ports:
-        if not port_is_open(port):
-            continue
-        leaked = True
-        pids = port_owner_pids(port)
-        pid_text = ", ".join(str(pid) for pid in pids) if pids else "unknown"
-        print(
-            f"error: residual server still listening on port {port} (pid {pid_text}); "
-            "the server process tree did not stop",
-            file=sys.stderr,
-        )
+        owned, external = owned_listeners(port)
+        if external:
+            print(
+                f"warning: port {port} is held by process(es) {external} outside this run's server tree",
+                file=sys.stderr,
+            )
+        if owned:
+            leaked = True
+            pid_text = ", ".join(str(pid) for pid in owned)
+            print(
+                f"error: residual server still listening on port {port} (pid {pid_text}); "
+                "the server process tree did not stop",
+                file=sys.stderr,
+            )
     return not leaked
 
 
@@ -996,13 +1152,38 @@ def build_manifest(
     manifest["dest"] = str(options.dest)
     manifest["abort_reason"] = abort_reason
     manifest["compare_exit"] = compare.get("exit")
-    if manifest["compare_exit"] is None:
-        compare_records = [record for record in records if record["stage"] == "compare"]
-        if compare_records:
-            manifest["compare_exit"] = compare_records[0]["returncode"]
     manifest["compare_verdict"] = compare.get("verdict")
     manifest["compare_md"] = compare.get("md")
     manifest["compare_json"] = compare.get("json")
+    manifest["compare_reports"] = compare.get("reports", {})
+    manifest["compare_note"] = compare.get("note")
+    if manifest["compare_exit"] is None:
+        # Only this plan's commands count; a shared log must not leak another
+        # plan's compare result, and a failed json run must not look like a 0.
+        prefix = str(plan.data_dir)
+
+        def plan_compare_record(suffix: str) -> dict[str, Any] | None:
+            for record in records:
+                if record["stage"] != "compare":
+                    continue
+                if not any(str(argument).startswith(prefix) for argument in record["argv"]):
+                    continue
+                if any(str(argument).endswith(suffix) for argument in record["argv"]):
+                    return record
+            return None
+
+        md_record = plan_compare_record("compare.md")
+        json_record = plan_compare_record("compare.json")
+        if md_record is None:
+            manifest["compare_note"] = "compare did not run for this plan"
+        elif not (plan.data_dir / "compare.md").is_file():
+            manifest["compare_note"] = "compare produced no compare.md for this plan"
+        elif json_record is None or not (plan.data_dir / "compare.json").is_file():
+            manifest["compare_note"] = "compare produced no compare.json for this plan"
+        elif json_record["returncode"] not in COMPARE_VERDICTS:
+            manifest["compare_note"] = "compare json run failed; compare_exit left null"
+        else:
+            manifest["compare_exit"] = md_record["returncode"]
     manifest["run_mode"] = plan.run_mode
     manifest["warning"] = STUB_WARNING if plan.run_mode == "stub" else None
     manifest["identity_source"] = (
@@ -1027,24 +1208,29 @@ def run_compare(
     if not collect_a.is_file() or not collect_b.is_file():
         raise Aborted("compare requested but a collect file is missing")
     base = [sys.executable, str(COMPARE_TOOL), "compare", "--a", str(collect_a), "--b", str(collect_b)]
-    info: dict[str, Any] = {"exit": None, "verdict": None, "md": None, "json": None}
-    started_ns = time.time_ns()
+    info: dict[str, Any] = {"exit": None, "verdict": None, "md": None, "json": None, "reports": {}}
     for suffix, path in (("md", plan.data_dir / "compare.md"), ("json", plan.data_dir / "compare.json")):
+        # Structural guarantee: prepare_data_dir moved/removed old reports, so a
+        # pre-existing file here is a bug, never a previous run's result.
+        if path.exists():
+            raise Aborted(f"stale {path.name} was present before compare; refusing to reuse it")
         argv = [*base, "--out", str(path)]
         result = executor.run(argv, REPO_ROOT, None, None)
         record_command(records, "compare", None, argv, REPO_ROOT, {}, result)
-        # Exit 0/1/2 are all verdicts the compare tool can legitimately reach;
-        # any other code, a missing report or a leftover one is a pipeline failure.
-        if result.returncode not in COMPARE_VERDICTS:
-            raise Aborted(f"compare crashed with {result.returncode}: {result.stderr.strip()}")
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        # Exit 0/1/2 are all verdicts the compare tool can legitimately reach;
+        # any other code or a missing report is a pipeline failure.
+        if result.returncode not in COMPARE_VERDICTS:
+            raise Aborted(f"compare crashed with {result.returncode} ({detail})")
         if not path.is_file():
             raise Aborted(f"compare exited {result.returncode} and produced no {path.name} this run ({detail})")
-        if path.stat().st_mtime_ns < started_ns - REPORT_FRESHNESS_SLACK_NS:
-            raise Aborted(
-                f"refusing stale {path.name} from an earlier run at {path}: "
-                "the report predates this run (pass --reuse-dir to archive old reports)"
-            )
+        stat = path.stat()
+        info["reports"][suffix] = {
+            "path": str(path),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "inode": stat.st_ino,
+        }
         info[suffix] = str(path)
         verdict = COMPARE_VERDICTS[result.returncode]
         if suffix == "md":
@@ -1306,10 +1492,11 @@ def run_rehearse(args: argparse.Namespace) -> int:
     """Entry point of ``rehearse``: the real orchestration with a stub server."""
     if not args.stub:
         return fail("rehearse currently only supports --stub; pass --stub to confirm the stub server")
-    if args.stub_tokens <= 0:
-        return fail(f"--stub-tokens must be positive, got {args.stub_tokens}")
-    serve_cmd = args.serve_cmd or stub_command()
+    if not 0 < args.stub_tokens <= MAX_STUB_TOKENS:
+        return fail(f"--stub-tokens must be between 1 and {MAX_STUB_TOKENS}, got {args.stub_tokens}")
     try:
+        validate_data_dir(Path(args.data_dir))
+        serve_cmd = args.serve_cmd or stub_command()
         options = rehearse_options(args)
         plan = ConfigPlan(
             slug="rehearse",
@@ -1342,6 +1529,7 @@ def run_real(args: argparse.Namespace) -> int:
     if not slugs:
         return fail("--configs needs at least one config slug")
     try:
+        validate_data_dir(Path(args.data_dir))
         validate_readiness_timeout(args.readiness_timeout)
         options = Options(
             dest=Path(args.dest),
@@ -1463,6 +1651,12 @@ def runner_log_lines(backend: str, log_mode: str) -> list[str]:
 
 def run_stub_server(args: argparse.Namespace) -> int:
     """Entry point of the hidden ``_stub-server`` used by the rehearsal."""
+    if not 0 < args.tokens <= MAX_STUB_TOKENS:
+        print(
+            f"error: --tokens must be between 1 and {MAX_STUB_TOKENS}, got {args.tokens}",
+            file=sys.stderr,
+        )
+        return EXIT_INPUT_ERROR
     for line in runner_log_lines(args.backend, args.log_mode):
         print(line, flush=True)
     handler = type("BoundStubHandler", (StubHandler,), {"tokens": args.tokens})
@@ -1526,7 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=len(STUB_PROMPT_TOKENS),
         help=(
-            "number of tokens the stub server returns; below --min-comparable-positions "
+            "number of tokens the stub server returns (1..32); below --min-comparable-positions "
             "the compare step is inconclusive"
         ),
     )

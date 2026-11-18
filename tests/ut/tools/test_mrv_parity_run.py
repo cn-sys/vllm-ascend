@@ -286,8 +286,9 @@ def test_compare_crash_without_a_report_still_aborts(tmp_path, monkeypatch):
     assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
     manifest = read_manifest(plan)
     assert "produced no compare.md this run" in manifest["abort_reason"]
-    assert manifest["compare_exit"] == 2
     assert "no output" in manifest["abort_reason"]
+    assert manifest["compare_exit"] is None
+    assert "no compare.md" in manifest["compare_note"]
     assert manifest["compare_verdict"] is None
     assert manifest["compare_md"] is None
     assert manifest["compare_json"] is None
@@ -472,6 +473,8 @@ def test_rehearse_publishes_the_full_archive(tmp_path):
     manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["compare_exit"] == 0
     assert manifest["abort_reason"] is None
+    assert set(manifest["compare_reports"]) == {"md", "json"}
+    assert "Traceback" not in (data / "mrv1" / "server.log").read_text(encoding="utf-8")
     for backend in parity.BACKENDS:
         assert manifest["backends"][backend]["collect_records"] == 2
         assert manifest["backends"][backend]["log_sha256"]
@@ -1080,24 +1083,34 @@ def test_install_signal_handlers_registers_available_signals():
 
 def test_terminate_process_groups_uses_the_child_group_on_posix(tmp_path, monkeypatch):
     calls: list[tuple[int, int]] = []
-    monkeypatch.setattr(parity.os, "name", "posix")
-    monkeypatch.setattr(parity.os, "killpg", lambda pid, sig: calls.append((pid, sig)), raising=False)
-    monkeypatch.setattr(parity.os, "getpgid", lambda pid: 9000 + pid, raising=False)
+
+    def fake_killpg(pgid, sig):
+        calls.append((pgid, sig))
+        if sig == parity.signal.SIGTERM:
+            process.returncode = 0
+
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity.os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        parity.os, "getpgid", lambda pid: pytest.fail("handler must use the stored pgid"), raising=False
+    )
     monkeypatch.setattr(parity.subprocess, "run", lambda *args, **kwargs: pytest.fail("taskkill on POSIX"))
     process = FakeProcess()
     process.pid = 123
     parity.LIVE_PROCESSES.add(process)
+    parity.LIVE_GROUPS[process.pid] = 5555
     try:
         parity.terminate_process_groups()
     finally:
         parity.LIVE_PROCESSES.discard(process)
-    # getpgid must receive the child pid (123), never 0 (the executor's own group).
-    assert calls == [(9123, parity.signal.SIGTERM)]
+        parity.LIVE_GROUPS.pop(process.pid, None)
+    # 5555 is the child's recorded pgid; the executor's own group (getpgid(0)) is never used.
+    assert calls == [(5555, parity.signal.SIGTERM)]
 
 
 def test_terminate_process_groups_uses_taskkill_on_windows(tmp_path, monkeypatch):
     commands: list[list[str]] = []
-    monkeypatch.setattr(parity.os, "name", "nt")
+    monkeypatch.setattr(parity, "is_windows", lambda: True)
     monkeypatch.setattr(parity.os, "killpg", lambda pid, sig: pytest.fail("killpg on Windows"), raising=False)
     monkeypatch.setattr(
         parity.subprocess,
@@ -1188,15 +1201,22 @@ def test_commands_env_is_whitelisted(tmp_path, monkeypatch):
     assert all("HCCL_BUFFSIZE" not in record["env"] for record in manifest["commands"])
 
 
-def test_stale_compare_json_is_rejected(tmp_path, monkeypatch, capsys):
+def test_old_report_is_archived_and_never_accepted(tmp_path, monkeypatch, capsys):
     no_http(monkeypatch)
     plan = make_plan(tmp_path)
-    executor = FakeExecutor(compare_rc=0, stale_suffix="json")
-    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    plan.data_dir.mkdir(parents=True)
+    old = plan.data_dir / "compare.json"
+    old.write_text('{"verdict": "PASS"}\n', encoding="utf-8")
+    os.utime(old, (time.time() - 1.5, time.time() - 1.5))
+    options = replace(make_options(tmp_path), reuse_dir=True)
+    executor = FakeExecutor(compare_writes=False)
+    assert parity.execute_config(plan, options, executor) == 2
     manifest = read_manifest(plan)
-    assert "refusing stale compare.json" in manifest["abort_reason"]
-    assert "compare.json" in manifest["abort_reason"]
+    # The 1.5 s old PASS json was moved away before the run and cannot be accepted.
+    assert not (plan.data_dir / "compare.json").exists()
+    assert (plan.data_dir / "compare.prev.json").read_text(encoding="utf-8") == '{"verdict": "PASS"}\n'
     assert manifest["compare_json"] is None
+    assert manifest["compare_note"]
 
 
 def test_reuse_dir_archives_both_reports(tmp_path, monkeypatch):
@@ -1214,9 +1234,9 @@ def test_reuse_dir_archives_both_reports(tmp_path, monkeypatch):
     assert any(path.endswith("compare.prev.json") for path in manifest["archived_compare"])
 
 
-def test_stop_uses_taskkill_on_windows(tmp_path, monkeypatch):
+def test_stop_skips_a_reaped_pid_on_windows(tmp_path, monkeypatch):
     commands: list[list[str]] = []
-    monkeypatch.setattr(parity.os, "name", "nt")
+    monkeypatch.setattr(parity, "is_windows", lambda: True)
     monkeypatch.setattr(
         parity.subprocess,
         "run",
@@ -1227,15 +1247,43 @@ def test_stop_uses_taskkill_on_windows(tmp_path, monkeypatch):
     process.returncode = 1
     launch = parity.Launch(process, tmp_path / "server.log")
     parity.Executor().stop(launch, 0.1)
+    assert ["taskkill", "/F", "/T", "/PID", "23732"] not in commands
+
+
+def test_stop_taskkills_a_live_pid_on_windows(tmp_path, monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(parity, "is_windows", lambda: True)
+    monkeypatch.setattr(parity, "kill_port_owners", lambda port: False)
+    monkeypatch.setattr(
+        parity.subprocess,
+        "run",
+        lambda argv, **kwargs: commands.append(list(argv)) or subprocess.CompletedProcess(argv, 0),
+    )
+
+    class LiveProcess(FakeProcess):
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    process = LiveProcess()
+    process.pid = 23732
+    launch = parity.Launch(process, tmp_path / "server.log")
+    parity.Executor().stop(launch, 0.1)
     assert ["taskkill", "/F", "/T", "/PID", "23732"] in commands
 
 
-def test_residual_server_report_names_the_pid(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(parity, "port_is_open", lambda port: True)
-    monkeypatch.setattr(parity, "port_owner_pids", lambda port: [23732])
-    assert parity.report_residual_servers([8000, 8001]) is False
+def test_residual_server_report_names_the_owned_pid(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(parity, "owned_listeners", lambda port: ([23732], []))
+    assert parity.report_residual_servers([8000]) is False
     err = capsys.readouterr().err
     assert "port 8000" in err and "pid 23732" in err
+
+
+def test_foreign_listener_is_only_a_warning(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(parity, "owned_listeners", lambda port: ([], [9999]))
+    assert parity.report_residual_servers([8000]) is True
+    err = capsys.readouterr().err
+    assert "warning:" in err and "9999" in err
 
 
 def test_readiness_must_be_positive(tmp_path, capsys):
@@ -1254,7 +1302,7 @@ def test_readiness_must_be_positive(tmp_path, capsys):
             ]
         )
         assert code == 2
-        assert "must be positive" in capsys.readouterr().err
+        assert "--readiness-timeout must be positive" in capsys.readouterr().err
 
 
 def test_data_dir_that_is_a_regular_file_is_rejected(tmp_path, capsys):
@@ -1265,10 +1313,11 @@ def test_data_dir_that_is_a_regular_file_is_rejected(tmp_path, capsys):
     assert "regular file" in capsys.readouterr().err
 
 
-def test_stub_tokens_must_be_positive(tmp_path, capsys):
-    code = parity.main(["rehearse", "--stub", "--data-dir", str(tmp_path / "d"), "--stub-tokens", "0"])
-    assert code == 2
-    assert "--stub-tokens must be positive" in capsys.readouterr().err
+def test_stub_tokens_must_be_within_range(tmp_path, capsys):
+    for value in ("0", "-1", "33"):
+        code = parity.main(["rehearse", "--stub", "--data-dir", str(tmp_path / f"d{value}"), "--stub-tokens", value])
+        assert code == 2
+        assert "must be between 1 and 32" in capsys.readouterr().err
 
 
 def test_signal_abort_during_load_plans_exits_cleanly(tmp_path, monkeypatch, capsys):
@@ -1285,35 +1334,172 @@ def test_signal_abort_during_load_plans_exits_cleanly(tmp_path, monkeypatch, cap
     assert "Traceback" not in err
 
 
-def test_kill_port_owners_taskkills_the_listener(monkeypatch):
-    commands: list[list[str]] = []
-    monkeypatch.setattr(parity.os, "name", "nt")
-    monkeypatch.setattr(parity, "port_is_open", lambda port: True)
-    monkeypatch.setattr(parity, "port_owner_pids", lambda port: [37232])
-    monkeypatch.setattr(
-        parity.subprocess,
-        "run",
-        lambda argv, **kwargs: commands.append(list(argv)) or subprocess.CompletedProcess(argv, 0),
-    )
-    parity.kill_port_owners(24560)
-    assert ["taskkill", "/F", "/T", "/PID", "37232"] in commands
+def test_run_entry_rejects_a_file_data_dir_without_a_traceback(tmp_path, capsys):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir\n", encoding="utf-8")
+    for extra in ((), ("--dry-run",)):
+        code = parity.main(
+            ["run", "--configs", "x", "--dest", str(tmp_path / "dest"), "--data-dir", str(blocker), *extra]
+        )
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "regular file" in err
+        assert "Traceback" not in err
 
 
-def test_stop_kills_a_listener_left_behind(tmp_path, monkeypatch):
-    commands: list[list[str]] = []
-    monkeypatch.setattr(parity.os, "name", "nt")
-    monkeypatch.setattr(parity, "port_is_open", lambda port: True)
-    monkeypatch.setattr(parity, "port_owner_pids", lambda port: [37232])
-    monkeypatch.setattr(
-        parity.subprocess,
-        "run",
-        lambda argv, **kwargs: commands.append(list(argv)) or subprocess.CompletedProcess(argv, 0),
+def test_listening_query_asks_for_listen_state_only(monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "1048\n1049\n", "")
+
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity.subprocess, "run", fake_run)
+    assert parity.listening_pids(24560) == [1048, 1049]
+    assert seen[0][:2] == ["lsof", "-nP"]
+    assert "-sTCP:LISTEN" in seen[0]
+
+
+def test_lsof_missing_degrades_to_a_warning(monkeypatch, capsys):
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity.subprocess, "run", fake_run)
+    assert parity.listening_pids(24560) == []
+    assert "lsof is unavailable" in capsys.readouterr().err
+
+
+def test_posix_fallback_kills_the_listener_but_not_the_client(monkeypatch):
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity, "listening_pids", lambda port: [1048, 1049])
+    monkeypatch.setattr(parity, "pid_owned_by_server", lambda pid: pid == 1048)
+    monkeypatch.setattr(parity.os, "kill", lambda pid, sig: killed.append((pid, sig)), raising=False)
+    assert parity.kill_port_owners(24560) is True
+    assert killed == [(1048, parity.signal.SIGTERM), (1048, parity.FORCE_KILL_SIGNAL)]
+
+
+def test_unknown_listener_is_never_killed(monkeypatch, capsys):
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity, "listening_pids", lambda port: [9999])
+    monkeypatch.setattr(parity, "pid_owned_by_server", lambda pid: False)
+    monkeypatch.setattr(parity.os, "kill", lambda pid, sig: pytest.fail("foreign listener killed"), raising=False)
+    assert parity.kill_port_owners(24560) is False
+    err = capsys.readouterr().err
+    assert "outside this run" in err and "9999" in err
+
+
+def test_handler_waits_grace_before_sigkill(monkeypatch):
+    events: list[tuple[str, int, float]] = []
+    started = time.monotonic()
+
+    class IgnoringServer(FakeProcess):
+        def terminate(self):
+            pass
+
+    process = IgnoringServer()
+    process.pid = 123
+
+    def fake_killpg(pgid, sig):
+        events.append(("signal", sig, time.monotonic() - started))
+        if sig == parity.FORCE_KILL_SIGNAL:
+            process.returncode = -9
+
+    monkeypatch.setattr(parity, "is_windows", lambda: False)
+    monkeypatch.setattr(parity.os, "killpg", fake_killpg, raising=False)
+    parity.LIVE_PROCESSES.add(process)
+    parity.LIVE_GROUPS[process.pid] = 5555
+    try:
+        parity.terminate_process_groups(grace=0.2)
+    finally:
+        parity.LIVE_PROCESSES.discard(process)
+        parity.LIVE_GROUPS.pop(process.pid, None)
+    kinds = [(sig, elapsed) for kind, sig, elapsed in events]
+    assert kinds[0][0] == parity.signal.SIGTERM
+    assert kinds[-1][0] == parity.FORCE_KILL_SIGNAL
+    assert kinds[-1][1] - kinds[0][1] >= 0.15
+
+
+def test_external_listener_does_not_change_the_exit_code(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(parity, "execute_config", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(parity, "owned_listeners", lambda port: ([], [9999]))
+    code = parity.main(["rehearse", "--stub", "--data-dir", str(tmp_path / "data")])
+    assert code == 0
+    assert "warning:" in capsys.readouterr().err
+
+
+def test_manifest_records_report_identity(tmp_path, monkeypatch):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    assert parity.execute_config(plan, make_options(tmp_path), FakeExecutor()) == 0
+    manifest = read_manifest(plan)
+    reports = manifest["compare_reports"]
+    assert set(reports) == {"md", "json"}
+    for entry in reports.values():
+        assert entry["size"] > 0
+        assert entry["mtime_ns"] > 0
+        assert "inode" in entry
+
+
+def test_compare_crash_with_rc3_reports_no_output(tmp_path, monkeypatch, capsys):
+    no_http(monkeypatch)
+    plan = make_plan(tmp_path)
+    executor = FakeExecutor(compare_rc=3, compare_writes=False)
+    assert parity.execute_config(plan, make_options(tmp_path), executor) == 2
+    manifest = read_manifest(plan)
+    assert "crashed with 3 (no output)" in manifest["abort_reason"]
+    assert manifest["compare_exit"] is None
+
+
+def test_second_plan_does_not_inherit_the_first_compare_exit(tmp_path):
+    options = make_options(tmp_path)
+    plan = make_plan(tmp_path)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    plan.data_dir.mkdir(parents=True)
+    records = [
+        {
+            "stage": "compare",
+            "backend": None,
+            "argv": ["python", "compare", "--out", str(other_dir / "compare.md")],
+            "returncode": 0,
+            "env": {},
+            "cwd": "",
+        },
+        {
+            "stage": "compare",
+            "backend": None,
+            "argv": ["python", "compare", "--out", str(other_dir / "compare.json")],
+            "returncode": 0,
+            "env": {},
+            "cwd": "",
+        },
+    ]
+    manifest = parity.build_manifest(
+        plan,
+        {"mrv1": parity.BackendRun("mrv1")},
+        records,
+        {"exit": None, "verdict": None, "md": None, "json": None, "reports": {}},
+        "compare aborted",
+        options,
     )
-    process = FakeProcess()
-    process.pid = 555
-    process.returncode = 0
-    launch = parity.Launch(process, tmp_path / "server.log", port=24560)
-    parity.Executor().stop(launch, 0.1)
-    pids = [command[4] for command in commands if command[:4] == ["taskkill", "/F", "/T", "/PID"]]
-    assert "555" in pids
-    assert "37232" in pids
+    assert manifest["compare_exit"] is None
+    assert "did not run for this plan" in manifest["compare_note"]
+
+
+def test_default_stub_token_count_is_pinned():
+    args = parity.build_parser().parse_args(["rehearse", "--stub", "--data-dir", "x"])
+    assert args.stub_tokens == 32
+    assert args.stub_tokens == len(parity.STUB_PROMPT_TOKENS) == parity.MAX_STUB_TOKENS
+
+
+def test_handle_termination_sigint_records_and_aborts(monkeypatch):
+    cleaned: list[bool] = []
+    monkeypatch.setattr(parity, "terminate_process_groups", lambda: cleaned.append(True))
+    with pytest.raises(parity.SignalAbort) as excinfo:
+        parity.handle_termination(parity.signal.SIGINT, None)
+    assert parity.SIGNAL_ABORT_REASON == "terminated by SIGINT"
+    assert "SIGINT" in str(excinfo.value)
+    assert cleaned == [True]
