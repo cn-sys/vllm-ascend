@@ -38,7 +38,28 @@ as unusable input.
 
 Logprobs are compared only at positions where both runs emitted the same token;
 a position whose tokens differ is reported as non-comparable and never fails a
-run, because a non-greedy sample legitimately diverges there.
+run, because a non-greedy sample legitimately diverges there. A comparable
+position that lacks a logprob on both sides (or on one side) is counted as
+missing evidence instead of being compared.
+
+``compare`` decides one of three verdicts per record and aggregates them:
+
+* ``PASS`` (exit 0) - the evidence is sufficient and every threshold holds.
+* ``FAIL`` (exit 1) - a structural failure (prompt/backend/temperature/parsed_ok
+  mismatch, greedy token divergence) or a violated decision threshold.
+* ``INCONCLUSIVE`` (exit 2) - the evidence is insufficient to judge: no tokens,
+  too few comparable positions, or too few logprobs. Insufficient evidence never
+  counts as a pass.
+
+Decision thresholds (also written into ``--help`` and echoed by both report
+formats):
+
+* ``--min-exact-match-rate`` (default 0.90): every non-greedy record must match
+  this share of its token positions exactly, otherwise it fails.
+* ``--min-comparable-ratio`` (default 0.50): a record needs this share of
+  token-equal (comparable) positions, otherwise it is inconclusive.
+* ``--min-logprob-coverage`` (default 0.90): of the comparable positions, this
+  share must carry a logprob on both sides, otherwise the record is inconclusive.
 
 Failure semantics:
 
@@ -49,14 +70,12 @@ Failure semantics:
   tokens or logprobs) -> the JSONL **is** written, the record keeps
   ``parsed_ok: false`` plus an ``error`` message, exit 1.
 * ``compare`` unusable input (unreadable file, malformed JSONL, missing or
-  duplicate field/id, unknown ``--out`` suffix, negative threshold) -> exit 2,
-  **no report file is written**.
-* ``compare`` parity failure (token divergence under greedy, logprob delta over
-  the threshold, ``parsed_ok`` false, configuration mismatch) -> the report **is**
-  written, exit 1.
+  duplicate field/id, unknown ``--out`` suffix, negative ``--max-logprob-delta``,
+  threshold outside [0, 1]) -> exit 2, **no report file is written**.
+* ``compare`` FAIL or INCONCLUSIVE -> the report **is** written, exit 1 or 2.
 
-Exit codes: ``0`` parity holds (every request was collected), ``1`` parity is
-broken, ``2`` the input or the environment is unusable.
+Exit codes: ``0`` parity holds, ``1`` parity is broken, ``2`` the input is
+unusable or the evidence is inconclusive.
 """
 
 # ruff: noqa: E402
@@ -104,6 +123,17 @@ GREEDY_TEMPERATURE = 0.0
 LOGPROB_TOP_K = 5
 MAX_LISTED_ITEMS = 5
 FRAGMENT_RADIUS = 2
+DEFAULT_MIN_EXACT_MATCH_RATE = 0.90
+DEFAULT_MIN_COMPARABLE_RATIO = 0.50
+DEFAULT_MIN_LOGPROB_COVERAGE = 0.90
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
+VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
+VERDICT_EXIT_CODES = {
+    VERDICT_PASS: EXIT_OK,
+    VERDICT_FAIL: EXIT_MISMATCH,
+    VERDICT_INCONCLUSIVE: EXIT_INPUT_ERROR,
+}
 RECORD_FIELDS = ("id", "backend", "prompt_sha1", "tokens", "logprobs", "finish_reason", "parsed_ok")
 REPORT_SUFFIXES = (".md", ".json")
 
@@ -126,6 +156,29 @@ class InputError(ValueError):
 
 class CollectError(RuntimeError):
     """A completion response cannot be turned into a comparable record."""
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """Decision thresholds for the three-state verdict.
+
+    Evidence below a threshold makes a record INCONCLUSIVE (or FAIL for the
+    exact-match rule), never PASS: a run whose logprobs are missing everywhere,
+    or whose two samples share no comparable position, says nothing about
+    parity and must not be reported as a pass.
+    """
+
+    min_exact_match_rate: float = DEFAULT_MIN_EXACT_MATCH_RATE
+    min_comparable_ratio: float = DEFAULT_MIN_COMPARABLE_RATIO
+    min_logprob_coverage: float = DEFAULT_MIN_LOGPROB_COVERAGE
+
+    def to_dict(self) -> dict[str, float]:
+        """JSON form of the thresholds, echoed by both report formats."""
+        return {
+            "min_exact_match_rate": self.min_exact_match_rate,
+            "min_comparable_ratio": self.min_comparable_ratio,
+            "min_logprob_coverage": self.min_logprob_coverage,
+        }
 
 
 def prompt_sha1(prompt: str) -> str:
@@ -275,6 +328,8 @@ class LogprobStats:
     positions: int = 0
     delta_sum: float = 0.0
     max_delta: float | None = None
+    missing_both: int = 0
+    missing_one_side: int = 0
     incomparable: list[IncomparablePosition] = field(default_factory=list)
 
 
@@ -296,7 +351,6 @@ def compare_logprobs(
     """
     stats = LogprobStats()
     deltas: list[tuple[int, float]] = []
-    missing: list[int] = []
     for position, (token_a, token_b, value_a, value_b) in enumerate(
         zip(tokens_a, tokens_b, logprobs_a, logprobs_b, strict=False)
     ):
@@ -304,13 +358,12 @@ def compare_logprobs(
             stats.incomparable.append(IncomparablePosition(position, token_a, token_b))
             continue
         if value_a is None and value_b is None:
+            stats.missing_both += 1
             continue
         if value_a is None or value_b is None:
-            missing.append(position)
+            stats.missing_one_side += 1
             continue
         deltas.append((position, abs(float(value_a) - float(value_b))))
-    if missing:
-        failures.append(f"{record_id}: logprob present on one side only at position(s) {missing[:MAX_LISTED_ITEMS]}")
     oversized = [(position, delta) for position, delta in deltas if delta > max_logprob_delta]
     if oversized:
         position, delta = oversized[0]
@@ -339,6 +392,14 @@ class TokenDiff:
     logprob_delta_sum: float
     max_logprob_delta: float | None
     parsed_ok: bool
+    exact_rate: float | None = None
+    comparable_ratio: float | None = None
+    logprob_coverage: float | None = None
+    comparable_positions: int = 0
+    missing_both_logprobs: int = 0
+    missing_one_side_logprobs: int = 0
+    verdict: str = VERDICT_PASS
+    verdict_reason: str = ""
     divergence_at: int | None = None
     fragment_a: str = ""
     fragment_b: str = ""
@@ -351,8 +412,10 @@ def compare_record(
     record_b: dict[str, Any],
     max_logprob_delta: float,
     greedy_require_exact: bool,
+    thresholds: Thresholds | None = None,
 ) -> TokenDiff:
     """Diff one MRV1 record against the MRV2 record that carries the same id."""
+    thresholds = Thresholds() if thresholds is None else thresholds
     record_id = record_a["id"]
     tokens_a = record_a["tokens"]
     tokens_b = record_b["tokens"]
@@ -410,6 +473,36 @@ def compare_record(
         max_logprob_delta,
         failures,
     )
+    exact_rate = position_matches / position_total if position_total else None
+    comparable_ratio = exact_rate
+    coverage = logprob_stats.positions / position_matches if position_matches else (0.0 if position_total else None)
+    verdict = VERDICT_PASS
+    verdict_reason = ""
+    if failures:
+        verdict = VERDICT_FAIL
+        verdict_reason = failures[0]
+    elif position_total == 0 or (not tokens_a and not tokens_b):
+        verdict = VERDICT_INCONCLUSIVE
+        verdict_reason = "both runs produced no tokens; there is nothing to compare"
+    elif not greedy and exact_rate is not None and exact_rate < thresholds.min_exact_match_rate:
+        verdict = VERDICT_FAIL
+        verdict_reason = (
+            f"non-greedy exact token match rate {exact_rate:.2%} is below "
+            f"--min-exact-match-rate {thresholds.min_exact_match_rate:.0%}"
+        )
+    elif comparable_ratio is not None and comparable_ratio < thresholds.min_comparable_ratio:
+        verdict = VERDICT_INCONCLUSIVE
+        verdict_reason = (
+            f"evidence insufficient: only {position_matches}/{position_total} comparable position(s) "
+            f"({comparable_ratio:.2%}) < --min-comparable-ratio {thresholds.min_comparable_ratio:.0%}"
+        )
+    elif coverage is not None and coverage < thresholds.min_logprob_coverage:
+        verdict = VERDICT_INCONCLUSIVE
+        verdict_reason = (
+            f"evidence insufficient: logprob coverage {logprob_stats.positions}/{position_matches} "
+            f"({coverage:.2%}) < --min-logprob-coverage {thresholds.min_logprob_coverage:.0%} "
+            f"(both missing {logprob_stats.missing_both}, one side missing {logprob_stats.missing_one_side})"
+        )
     return TokenDiff(
         record_id=record_id,
         greedy=greedy,
@@ -422,6 +515,14 @@ def compare_record(
         logprob_delta_sum=logprob_stats.delta_sum,
         max_logprob_delta=logprob_stats.max_delta,
         parsed_ok=parsed_ok,
+        exact_rate=exact_rate,
+        comparable_ratio=comparable_ratio,
+        logprob_coverage=coverage,
+        comparable_positions=position_matches,
+        missing_both_logprobs=logprob_stats.missing_both,
+        missing_one_side_logprobs=logprob_stats.missing_one_side,
+        verdict=verdict,
+        verdict_reason=verdict_reason,
         divergence_at=divergence_at,
         fragment_a=fragment_a,
         fragment_b=fragment_b,
@@ -444,10 +545,27 @@ class ComparisonReport:
     missing_ids: list[str] = field(default_factory=list)
     unexpected_ids: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    thresholds: Thresholds = field(default_factory=Thresholds)
+
+    @property
+    def verdict(self) -> str:
+        """Aggregate the record verdicts: FAIL wins, then INCONCLUSIVE, then PASS."""
+        if self.failures or any(diff.verdict == VERDICT_FAIL for diff in self.diffs):
+            return VERDICT_FAIL
+        if any(diff.verdict == VERDICT_INCONCLUSIVE for diff in self.diffs):
+            return VERDICT_INCONCLUSIVE
+        return VERDICT_PASS
 
     @property
     def passed(self) -> bool:
-        return not self.failures
+        return self.verdict == VERDICT_PASS
+
+    def verdict_counts(self) -> dict[str, int]:
+        """How many records landed in each verdict bucket."""
+        counts = {VERDICT_PASS: 0, VERDICT_FAIL: 0, VERDICT_INCONCLUSIVE: 0}
+        for diff in self.diffs:
+            counts[diff.verdict] = counts.get(diff.verdict, 0) + 1
+        return counts
 
 
 def compare_files(
@@ -455,8 +573,10 @@ def compare_files(
     path_b: str | Path,
     max_logprob_delta: float = DEFAULT_MAX_LOGPROB_DELTA,
     greedy_require_exact: bool = True,
+    thresholds: Thresholds | None = None,
 ) -> ComparisonReport:
     """Load two collected JSONL files and diff them record by record."""
+    thresholds = Thresholds() if thresholds is None else thresholds
     records_a = load_jsonl(path_a)
     records_b = load_jsonl(path_b)
     index_a = index_records(records_a, str(path_a))
@@ -468,6 +588,7 @@ def compare_files(
         greedy_require_exact=greedy_require_exact,
         records_a=len(records_a),
         records_b=len(records_b),
+        thresholds=thresholds,
     )
     report.missing_ids = [record_id for record_id in index_a if record_id not in index_b]
     report.unexpected_ids = [record_id for record_id in index_b if record_id not in index_a]
@@ -484,7 +605,7 @@ def compare_files(
         record_b = index_b.get(record_id)
         if record_b is None:
             continue
-        diff = compare_record(record_a, record_b, max_logprob_delta, greedy_require_exact)
+        diff = compare_record(record_a, record_b, max_logprob_delta, greedy_require_exact, thresholds)
         report.diffs.append(diff)
         report.failures.extend(diff.failures)
     if report.records_a != report.records_b:
@@ -520,6 +641,16 @@ def summarize(report: ComparisonReport) -> dict[str, Any]:
         "max_logprob_delta": max_delta,
         "mean_logprob_delta": _rate(logprob_delta_sum, logprob_positions),
         "parsed_ok_rate": _rate(sum(1 for diff in report.diffs if diff.parsed_ok), len(report.diffs)),
+        "records_passed": report.verdict_counts()[VERDICT_PASS],
+        "records_failed": report.verdict_counts()[VERDICT_FAIL],
+        "records_inconclusive": report.verdict_counts()[VERDICT_INCONCLUSIVE],
+        "inconclusive_records": [diff.record_id for diff in report.diffs if diff.verdict == VERDICT_INCONCLUSIVE],
+        "failed_records": [diff.record_id for diff in report.diffs if diff.verdict == VERDICT_FAIL],
+        "exact_match_rate": _rate(position_matches, position_total),
+        "comparable_ratio": _rate(position_matches, position_total),
+        "logprob_coverage": _rate(logprob_positions, position_matches),
+        "thresholds": report.thresholds.to_dict(),
+        "verdict": report.verdict,
         "passed": report.passed,
     }
 
@@ -545,6 +676,14 @@ def report_to_dict(report: ComparisonReport, metrics: dict[str, Any]) -> dict[st
                 "position_matches": diff.position_matches,
                 "max_logprob_delta": diff.max_logprob_delta,
                 "parsed_ok": diff.parsed_ok,
+                "exact_rate": diff.exact_rate,
+                "comparable_ratio": diff.comparable_ratio,
+                "comparable_positions": diff.comparable_positions,
+                "logprob_coverage": diff.logprob_coverage,
+                "missing_both_logprobs": diff.missing_both_logprobs,
+                "missing_one_side_logprobs": diff.missing_one_side_logprobs,
+                "verdict": diff.verdict,
+                "verdict_reason": diff.verdict_reason,
                 "divergence_at": diff.divergence_at,
                 "fragment_a": diff.fragment_a,
                 "fragment_b": diff.fragment_b,
@@ -556,6 +695,8 @@ def report_to_dict(report: ComparisonReport, metrics: dict[str, Any]) -> dict[st
             for diff in report.diffs
         ],
         "failures": report.failures,
+        "verdict": report.verdict,
+        "thresholds": report.thresholds.to_dict(),
         "passed": report.passed,
     }
 
@@ -569,12 +710,18 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         f"- MRV2 input (`--b`): `{report.b_path}` ({report.records_b} record(s))",
         f"- max logprob delta allowed: {report.max_logprob_delta}",
         f"- greedy exact tokens required: {'yes' if report.greedy_require_exact else 'no'}",
+        f"- min exact match rate (non-greedy): {report.thresholds.min_exact_match_rate}",
+        f"- min comparable ratio: {report.thresholds.min_comparable_ratio}",
+        f"- min logprob coverage: {report.thresholds.min_logprob_coverage}",
+        f"- verdict: {report.verdict}",
         "",
         "## Summary",
         "",
         "| metric | value |",
         "|---|---|",
         f"| records compared | {metrics['records_compared']} |",
+        f"| records PASS / FAIL / INCONCLUSIVE | {metrics['records_passed']} / {metrics['records_failed']} "
+        f"/ {metrics['records_inconclusive']} |",
         f"| exact token match rate | {_format_rate(metrics['exact_token_match_rate'])} |",
         f"| greedy exact match rate ({metrics['greedy_records']} record(s)) "
         f"| {_format_rate(metrics['greedy_exact_token_match_rate'])} |",
@@ -585,6 +732,12 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         f"| max logprob delta | {_format_delta(metrics['max_logprob_delta'])} |",
         f"| mean logprob delta | {_format_delta(metrics['mean_logprob_delta'])} |",
         f"| parsed_ok rate | {_format_rate(metrics['parsed_ok_rate'])} |",
+        f"| exact match rate (all records) | {_format_rate(metrics['exact_match_rate'])} |",
+        f"| comparable ratio (all records) | {_format_rate(metrics['comparable_ratio'])} |",
+        f"| logprob coverage (all records) | {_format_rate(metrics['logprob_coverage'])} |",
+        f"| min exact match rate (non-greedy) | {_format_rate(report.thresholds.min_exact_match_rate)} |",
+        f"| min comparable ratio | {_format_rate(report.thresholds.min_comparable_ratio)} |",
+        f"| min logprob coverage | {_format_rate(report.thresholds.min_logprob_coverage)} |",
         f"| missing ids | {_preview(report.missing_ids) if report.missing_ids else 'none'} |",
         f"| unexpected ids | {_preview(report.unexpected_ids) if report.unexpected_ids else 'none'} |",
         "",
@@ -593,16 +746,17 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         "",
         "## Records",
         "",
-        "| id | greedy | tokens (a/b) | exact | pos match | non-comparable | max logprob delta | parsed_ok | verdict |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| id | greedy | tokens (a/b) | exact% | comparable | logprob coverage "
+        "| non-comparable | max logprob delta | parsed_ok | verdict |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for diff in report.diffs:
-        verdict = "PASS" if not diff.failures else "FAIL"
-        pos_match = _format_rate(_rate(diff.position_matches, diff.position_total))
+        comparable = f"{diff.position_matches}/{diff.position_total} ({_format_rate(diff.comparable_ratio)})"
+        coverage = f"{diff.logprob_positions}/{diff.position_matches} ({_format_rate(diff.logprob_coverage)})"
         lines.append(
             f"| `{diff.record_id}` | {'yes' if diff.greedy else 'no'} | {diff.tokens_a}/{diff.tokens_b} "
-            f"| {'yes' if diff.exact_tokens else 'no'} | {pos_match} | {len(diff.incomparable)} "
-            f"| {_format_delta(diff.max_logprob_delta)} | {'yes' if diff.parsed_ok else 'no'} | {verdict} |"
+            f"| {_format_rate(diff.exact_rate)} | {comparable} | {coverage} | {len(diff.incomparable)} "
+            f"| {_format_delta(diff.max_logprob_delta)} | {'yes' if diff.parsed_ok else 'no'} | {diff.verdict} |"
         )
     lines += ["", "## Token divergences", ""]
     divergent = [diff for diff in report.diffs if not diff.exact_tokens]
@@ -613,7 +767,10 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
             for diff in divergent
         ]
         if report.greedy_require_exact:
-            lines += ["", "Greedy records must match exactly; non-greedy records are listed for information only."]
+            lines += [
+                "",
+                "Greedy records must match exactly; non-greedy records are judged by --min-exact-match-rate.",
+            ]
     else:
         lines.append("No token divergence between the two runs.")
     lines += ["", "## Non-comparable positions", ""]
@@ -631,10 +788,41 @@ def render_markdown(report: ComparisonReport, metrics: dict[str, Any]) -> str:
         ]
     else:
         lines.append("Every aligned position carries the same token in both runs.")
+    lines += ["", "## Failed records", ""]
+    failed = [diff for diff in report.diffs if diff.verdict == VERDICT_FAIL]
+    if failed:
+        lines += ["| id | reason |", "|---|---|"]
+        lines += [f"| `{diff.record_id}` | {diff.verdict_reason} |" for diff in failed]
+    else:
+        lines.append("None.")
+    lines += ["", "## Inconclusive records", ""]
+    inconclusive = [diff for diff in report.diffs if diff.verdict == VERDICT_INCONCLUSIVE]
+    if inconclusive:
+        lines += ["| id | reason |", "|---|---|"]
+        lines += [f"| `{diff.record_id}` | {diff.verdict_reason} |" for diff in inconclusive]
+    else:
+        lines.append("None.")
     lines += ["", "## Failures", ""]
     lines += [f"- {failure}" for failure in report.failures] if report.failures else ["None."]
-    lines += ["", f"## Verdict: {'PASS' if report.passed else 'FAIL'}", ""]
+    lines += ["", f"## Verdict: {report.verdict}", ""]
     return "\n".join(lines)
+
+
+def build_thresholds(args: argparse.Namespace) -> Thresholds:
+    """Validate the three rate thresholds and package them for the report."""
+    values = {
+        "--min-exact-match-rate": args.min_exact_match_rate,
+        "--min-comparable-ratio": args.min_comparable_ratio,
+        "--min-logprob-coverage": args.min_logprob_coverage,
+    }
+    for name, value in values.items():
+        if not 0.0 <= float(value) <= 1.0:
+            raise InputError(f"{name} must be within [0, 1], got {value!r}")
+    return Thresholds(
+        min_exact_match_rate=float(args.min_exact_match_rate),
+        min_comparable_ratio=float(args.min_comparable_ratio),
+        min_logprob_coverage=float(args.min_logprob_coverage),
+    )
 
 
 def run_compare(args: argparse.Namespace) -> int:
@@ -647,7 +835,12 @@ def run_compare(args: argparse.Namespace) -> int:
         print("error: --max-logprob-delta must not be negative", file=sys.stderr)
         return EXIT_INPUT_ERROR
     try:
-        report = compare_files(args.a, args.b, args.max_logprob_delta, args.greedy_require_exact)
+        thresholds = build_thresholds(args)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+    try:
+        report = compare_files(args.a, args.b, args.max_logprob_delta, args.greedy_require_exact, thresholds)
         metrics = summarize(report)
         if out_path.suffix.lower() == ".json":
             text = json.dumps(report_to_dict(report, metrics), indent=2, ensure_ascii=False) + "\n"
@@ -661,7 +854,11 @@ def run_compare(args: argparse.Namespace) -> int:
     print(
         f"records compared: {metrics['records_compared']} "
         f"(a={metrics['records_a']}, b={metrics['records_b']}); "
-        f"exact token match rate {_format_rate(metrics['exact_token_match_rate'])}; "
+        f"PASS {metrics['records_passed']} / FAIL {metrics['records_failed']} "
+        f"/ INCONCLUSIVE {metrics['records_inconclusive']}; "
+        f"exact match rate {_format_rate(metrics['exact_match_rate'])}; "
+        f"comparable ratio {_format_rate(metrics['comparable_ratio'])}; "
+        f"logprob coverage {_format_rate(metrics['logprob_coverage'])}; "
         f"max logprob delta {_format_delta(metrics['max_logprob_delta'])} "
         f"(allowed {report.max_logprob_delta}); "
         f"{metrics['incomparable_positions']} non-comparable position(s)"
@@ -670,9 +867,9 @@ def run_compare(args: argparse.Namespace) -> int:
         print(f"failures: {len(report.failures)}")
         for failure in report.failures:
             print(f"  - {failure}")
-    print(f"verdict: {'PASS' if report.passed else 'FAIL'}")
     print(f"report: {out_path}")
-    return EXIT_OK if report.passed else EXIT_MISMATCH
+    print(f"verdict: {report.verdict}")
+    return VERDICT_EXIT_CODES[report.verdict]
 
 
 def _require_optional_number(request: dict[str, Any], name: str, origin: str, integer: bool = False) -> None:
@@ -895,6 +1092,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_LOGPROB_DELTA,
         help=f"per token logprob delta treated as a mismatch (default: {DEFAULT_MAX_LOGPROB_DELTA})",
+    )
+    compare.add_argument(
+        "--min-exact-match-rate",
+        type=float,
+        default=DEFAULT_MIN_EXACT_MATCH_RATE,
+        help=(
+            f"non-greedy records whose exact token match rate is lower fail (default: {DEFAULT_MIN_EXACT_MATCH_RATE})"
+        ),
+    )
+    compare.add_argument(
+        "--min-comparable-ratio",
+        type=float,
+        default=DEFAULT_MIN_COMPARABLE_RATIO,
+        help=(
+            "records below this share of comparable (token-equal) positions are inconclusive "
+            f"(default: {DEFAULT_MIN_COMPARABLE_RATIO})"
+        ),
+    )
+    compare.add_argument(
+        "--min-logprob-coverage",
+        type=float,
+        default=DEFAULT_MIN_LOGPROB_COVERAGE,
+        help=(
+            "records below this share of comparable positions carrying a logprob on both sides are "
+            f"inconclusive (default: {DEFAULT_MIN_LOGPROB_COVERAGE})"
+        ),
     )
     compare.add_argument(
         "--greedy-require-exact",

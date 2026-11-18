@@ -115,7 +115,8 @@ def test_logprob_delta_over_threshold_fails(tmp_path: Path):
 
     assert code == compare_tool.EXIT_MISMATCH
     assert "logprob delta 0.300000 at position 1 exceeds" in report
-    assert "| `p1` | yes | 2/2 | yes | 100.00% | 0 | 0.300000 |" in report
+    assert "| `p1` | yes | 2/2 | 100.00% | 2/2 (100.00%) | 2/2 (100.00%) | 0 | 0.300000 | yes | FAIL |" in report
+    assert "## Verdict: FAIL" in report
 
 
 def test_logprob_delta_within_threshold_passes(tmp_path: Path):
@@ -201,16 +202,18 @@ def test_unknown_report_suffix_is_input_error(tmp_path: Path, capsys: pytest.Cap
     assert not out.exists()
 
 
-def test_greedy_exact_check_applies_only_to_temperature_zero(tmp_path: Path):
+def test_exact_match_rule_applies_only_to_non_greedy_records(tmp_path: Path):
     sampled = 0.7
     records_a = [make_record("p1", ["a", "b"], backend="mrv1", temperature=sampled)]
     records_b = [make_record("p1", ["a", "c"], backend="mrv2", temperature=sampled)]
 
     code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
 
-    assert code == compare_tool.EXIT_OK
+    # 1 of 2 token positions match: 50% < the 90% non-greedy exact-rate default.
+    assert code == compare_tool.EXIT_MISMATCH
     assert "| `p1` | 1 |" in report
-    assert "non-greedy records are listed for information only" in report
+    assert "non-greedy exact token match rate 50.00% is below --min-exact-match-rate 90%" in report
+    assert "judged by --min-exact-match-rate" in report
 
     records_a = [make_record("p1", ["a", "b"], backend="mrv1", temperature=0.0)]
     records_b = [make_record("p1", ["a", "c"], backend="mrv2", temperature=0.0)]
@@ -475,7 +478,7 @@ def test_non_greedy_divergence_skips_logprobs_of_that_position(tmp_path: Path):
     records_a = [make_record("s1", tokens_a, [-0.1, -0.2, -0.3], backend="mrv1", temperature=0.7)]
     records_b = [make_record("s1", tokens_b, [-0.1, -0.7, -0.3], backend="mrv2", temperature=0.7)]
 
-    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-exact-match-rate", "0.5")
 
     assert code == compare_tool.EXIT_OK
     assert "non-comparable positions (tokens differ) | 1 |" in report
@@ -502,12 +505,28 @@ def test_incomparable_positions_reach_the_json_report(tmp_path: Path):
     path_a, path_b = write_pair(tmp_path, records_a, records_b)
     out = tmp_path / "report.json"
 
-    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+    code = compare_tool.main(
+        [
+            "compare",
+            "--a",
+            str(path_a),
+            "--b",
+            str(path_b),
+            "--out",
+            str(out),
+            "--min-exact-match-rate",
+            "0.4",
+        ]
+    )
 
     assert code == compare_tool.EXIT_OK
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["metrics"]["incomparable_positions"] == 1
     assert payload["records"][0]["incomparable"] == [{"position": 1, "a": "n", "b": "NN"}]
+    assert payload["records"][0]["exact_rate"] == 0.5
+    assert payload["records"][0]["comparable_positions"] == 1
+    assert payload["records"][0]["logprob_coverage"] == 1.0
+    assert payload["records"][0]["verdict"] == "PASS"
 
 
 def test_token_length_mismatch_under_greedy_fails(tmp_path: Path):
@@ -520,15 +539,16 @@ def test_token_length_mismatch_under_greedy_fails(tmp_path: Path):
     assert "g1: greedy generation diverged at token 2" in report
 
 
-def test_token_length_mismatch_under_sampling_passes(tmp_path: Path):
+def test_token_length_mismatch_under_sampling_fails_exact_rate(tmp_path: Path):
     records_a = [make_record("s1", ["a", "b", "c"], backend="mrv1", temperature=0.7)]
     records_b = [make_record("s1", ["a", "b"], backend="mrv2", temperature=0.7)]
 
     code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
 
-    assert code == compare_tool.EXIT_OK
+    assert code == compare_tool.EXIT_MISMATCH
     assert "| 3/2 |" in report
-    assert "## Verdict: PASS" in report
+    assert "non-greedy exact token match rate 66.67% is below --min-exact-match-rate 90%" in report
+    assert "## Verdict: FAIL" in report
 
 
 def test_temperature_mismatch_fails(tmp_path: Path):
@@ -591,3 +611,259 @@ def test_negative_max_logprob_delta_is_input_error(tmp_path: Path, capsys: pytes
     assert code == compare_tool.EXIT_INPUT_ERROR
     assert "must not be negative" in capsys.readouterr().err
     assert not out.exists()
+
+
+def test_non_greedy_zero_exact_match_fails(tmp_path: Path):
+    records_a = [make_record("p1", ["a", "b", "c"], backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", ["x", "y", "z"], backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "non-greedy exact token match rate 0.00% is below --min-exact-match-rate 90%" in report
+    assert "## Verdict: FAIL" in report
+
+
+def test_both_sides_missing_logprobs_is_inconclusive(tmp_path: Path):
+    tokens = ["a", "b"]
+    records_a = [make_record("p1", tokens, [None, None], backend="mrv1")]
+    records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "## Verdict: INCONCLUSIVE" in report
+    assert "## Inconclusive records" in report
+    assert "logprob coverage 0/2" in report
+    assert "both missing 2, one side missing 0" in report
+
+
+def test_one_side_missing_logprobs_is_inconclusive(tmp_path: Path):
+    tokens = ["a", "b"]
+    records_a = [make_record("p1", tokens, [-0.1, -0.2], backend="mrv1")]
+    records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "both missing 0, one side missing 2" in report
+    assert "## Verdict: INCONCLUSIVE" in report
+
+
+def test_comparable_ratio_below_threshold_is_inconclusive(tmp_path: Path):
+    records_a = [make_record("g1", ["a", "x", "y"], backend="mrv1", temperature=0.0)]
+    records_b = [make_record("g1", ["a", "p", "q"], backend="mrv2", temperature=0.0)]
+
+    # Greedy exactness is disabled on purpose: the comparable-ratio rule must
+    # catch the record even though greedy divergence would otherwise fail it.
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--no-greedy-require-exact")
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "evidence insufficient: only 1/3 comparable position(s)" in report
+    assert "## Verdict: INCONCLUSIVE" in report
+
+
+def test_exact_rate_at_the_threshold_passes(tmp_path: Path):
+    tokens_a = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    tokens_b = list(tokens_a[:-1]) + ["Z"]
+    records_a = [make_record("p1", tokens_a, backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", tokens_b, backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_OK
+    assert "| 90.00% | 9/10 (90.00%) |" in report
+    assert "## Verdict: PASS" in report
+
+
+def test_exact_rate_below_the_threshold_fails(tmp_path: Path):
+    tokens_a = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    tokens_b = list(tokens_a[:-2]) + ["Y", "Z"]
+    records_a = [make_record("p1", tokens_a, backend="mrv1", temperature=0.7)]
+    records_b = [make_record("p1", tokens_b, backend="mrv2", temperature=0.7)]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "non-greedy exact token match rate 80.00% is below --min-exact-match-rate 90%" in report
+
+
+def test_empty_tokens_are_inconclusive(tmp_path: Path):
+    records_a = [make_record("p1", [], [], backend="mrv1")]
+    records_b = [make_record("p1", [], [], backend="mrv2")]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "both runs produced no tokens" in report
+    assert "## Verdict: INCONCLUSIVE" in report
+
+
+def test_inconclusive_aggregation_beats_pass(tmp_path: Path):
+    records_a = [
+        make_record("pass1", ["a"], backend="mrv1"),
+        make_record("inc1", ["b"], [None], backend="mrv1"),
+    ]
+    records_b = [
+        make_record("pass1", ["a"], backend="mrv2"),
+        make_record("inc1", ["b"], [None], backend="mrv2"),
+    ]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "## Verdict: INCONCLUSIVE" in report
+    assert "| records PASS / FAIL / INCONCLUSIVE | 1 / 0 / 1 |" in report
+
+
+def test_fail_aggregation_beats_inconclusive(tmp_path: Path):
+    records_a = [
+        make_record("inc1", ["b"], [None], backend="mrv1"),
+        make_record("fail1", ["a", "b"], backend="mrv1", temperature=0.7),
+    ]
+    records_b = [
+        make_record("inc1", ["b"], [None], backend="mrv2"),
+        make_record("fail1", ["x", "y"], backend="mrv2", temperature=0.7),
+    ]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b))
+
+    assert code == compare_tool.EXIT_MISMATCH
+    assert "## Verdict: FAIL" in report
+    assert "| records PASS / FAIL / INCONCLUSIVE | 0 / 1 / 1 |" in report
+
+
+def test_thresholds_are_echoed_in_markdown(tmp_path: Path):
+    records_a = [make_record("p1", ["a", "b"], backend="mrv1")]
+    records_b = [make_record("p1", ["a", "b"], backend="mrv2")]
+
+    code, report = run_compare(
+        tmp_path,
+        *write_pair(tmp_path, records_a, records_b),
+        "--min-exact-match-rate",
+        "0.5",
+        "--min-comparable-ratio",
+        "0.4",
+        "--min-logprob-coverage",
+        "0.6",
+    )
+
+    assert code == compare_tool.EXIT_OK
+    assert "- min exact match rate (non-greedy): 0.5" in report
+    assert "- min comparable ratio: 0.4" in report
+    assert "- min logprob coverage: 0.6" in report
+    assert "| min exact match rate (non-greedy) | 50.00% |" in report
+    assert "| min comparable ratio | 40.00% |" in report
+    assert "| min logprob coverage | 60.00% |" in report
+
+
+def test_thresholds_are_echoed_in_json(tmp_path: Path):
+    records_a = [make_record("p1", ["a", "b"], backend="mrv1")]
+    records_b = [make_record("p1", ["a", "b"], backend="mrv2")]
+    path_a, path_b = write_pair(tmp_path, records_a, records_b)
+    out = tmp_path / "report.json"
+
+    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+
+    assert code == compare_tool.EXIT_OK
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "PASS"
+    assert payload["thresholds"] == {
+        "min_exact_match_rate": 0.90,
+        "min_comparable_ratio": 0.50,
+        "min_logprob_coverage": 0.90,
+    }
+    assert payload["metrics"]["thresholds"] == payload["thresholds"]
+    assert payload["metrics"]["exact_match_rate"] == 1.0
+    assert payload["metrics"]["comparable_ratio"] == 1.0
+    assert payload["metrics"]["logprob_coverage"] == 1.0
+    assert payload["metrics"]["inconclusive_records"] == []
+    assert payload["metrics"]["records_passed"] == 1
+    assert payload["records"][0]["verdict"] == "PASS"
+    assert payload["records"][0]["exact_rate"] == 1.0
+    assert payload["records"][0]["comparable_positions"] == 2
+
+
+def test_inconclusive_json_metrics(tmp_path: Path):
+    tokens = ["a", "b"]
+    records_a = [make_record("p1", tokens, [None, None], backend="mrv1")]
+    records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
+    path_a, path_b = write_pair(tmp_path, records_a, records_b)
+    out = tmp_path / "report.json"
+
+    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "INCONCLUSIVE"
+    assert payload["metrics"]["inconclusive_records"] == ["p1"]
+    assert payload["metrics"]["records_inconclusive"] == 1
+    assert payload["records"][0]["missing_both_logprobs"] == 2
+    assert payload["records"][0]["missing_one_side_logprobs"] == 0
+    assert payload["records"][0]["logprob_coverage"] == 0.0
+    assert "evidence insufficient" in payload["records"][0]["verdict_reason"]
+
+
+def test_comparable_ratio_threshold_can_be_lowered(tmp_path: Path):
+    records_a = [make_record("g1", ["a", "x", "y"], backend="mrv1", temperature=0.0)]
+    records_b = [make_record("g1", ["a", "p", "q"], backend="mrv2", temperature=0.0)]
+
+    code, report = run_compare(
+        tmp_path,
+        *write_pair(tmp_path, records_a, records_b),
+        "--no-greedy-require-exact",
+        "--min-comparable-ratio",
+        "0.3",
+    )
+
+    assert code == compare_tool.EXIT_OK
+    assert "## Verdict: PASS" in report
+
+
+def test_logprob_coverage_threshold_can_be_lowered(tmp_path: Path):
+    tokens = ["a", "b"]
+    records_a = [make_record("p1", tokens, [None, None], backend="mrv1")]
+    records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
+
+    code, report = run_compare(tmp_path, *write_pair(tmp_path, records_a, records_b), "--min-logprob-coverage", "0.0")
+
+    assert code == compare_tool.EXIT_OK
+    assert "## Verdict: PASS" in report
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--min-exact-match-rate", "-0.1"),
+        ("--min-exact-match-rate", "1.5"),
+        ("--min-comparable-ratio", "-0.1"),
+        ("--min-comparable-ratio", "1.5"),
+        ("--min-logprob-coverage", "-0.1"),
+        ("--min-logprob-coverage", "1.5"),
+    ],
+)
+def test_threshold_outside_unit_interval_is_input_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture, flag: str, value: str
+):
+    path_a, path_b = write_pair(tmp_path, [make_record("p1", ["a"])], [make_record("p1", ["a"], backend="mrv2")])
+    out = tmp_path / "report.md"
+
+    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out), flag, value])
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    assert "must be within [0, 1]" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_stdout_last_line_is_the_verdict(tmp_path: Path, capsys: pytest.CaptureFixture):
+    tokens = ["a", "b"]
+    records_a = [make_record("p1", tokens, [None, None], backend="mrv1")]
+    records_b = [make_record("p1", tokens, [None, None], backend="mrv2")]
+    path_a, path_b = write_pair(tmp_path, records_a, records_b)
+    out = tmp_path / "report.md"
+
+    code = compare_tool.main(["compare", "--a", str(path_a), "--b", str(path_b), "--out", str(out)])
+
+    assert code == compare_tool.EXIT_INPUT_ERROR
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines[-1] == "verdict: INCONCLUSIVE"
