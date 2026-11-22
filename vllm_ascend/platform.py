@@ -39,6 +39,7 @@ from vllm_ascend.ascend_config import (
     init_ascend_config,
     is_draft_config_context,
 )
+from vllm_ascend.attention.context_parallel.topology import resolve_cp_topology, validate_dcp_block_interleave
 from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
     DeviceAdaptorFamily,
@@ -711,6 +712,7 @@ class NPUPlatform(Platform):
 
         # 9.Validate SFA / DCP / KV and SP consistency (vllm_config)
         _validate_sfa_dcp_kv_sp(vllm_config)
+        validate_dcp_block_interleave(resolve_cp_topology(vllm_config), vllm_config.cache_config)
 
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)
